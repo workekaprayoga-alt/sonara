@@ -1,5 +1,5 @@
-// Sonara Service Worker v8
-const CACHE = 'sonara-v8';
+// Sonara Service Worker v9
+const CACHE = 'sonara-v9';
 const CORE = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {

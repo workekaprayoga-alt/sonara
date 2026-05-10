@@ -34,8 +34,8 @@
           sans: ['Figtree', 'system-ui', '-apple-system', 'sans-serif'],
         },
         animation: {
-          'slide-up': 'slideUp 320ms cubic-bezier(0.32, 0.72, 0, 1)',
-          'slide-down': 'slideDown 280ms cubic-bezier(0.32, 0.72, 0, 1)',
+          'slide-up': 'slideUp 380ms cubic-bezier(0.16, 1, 0.3, 1)',
+          'slide-down': 'slideDown 340ms cubic-bezier(0.4, 0, 0.2, 1)',
           'fade-in': 'fadeIn 200ms ease-out',
           'eq-bar': 'eqBar 1s ease-in-out infinite',
         }
@@ -80,10 +80,10 @@
     from { opacity: 1; }
     to { opacity: 0; }
   }
-  /* Class util untuk close animation */
-  .closing-sheet { animation: slideDown 240ms cubic-bezier(0.32, 0.72, 0, 1) forwards; }
-  .closing-backdrop { animation: fadeOut 240ms ease-out forwards; }
-  .closing-fullplayer { animation: slideDown 280ms cubic-bezier(0.32, 0.72, 0, 1) forwards; }
+  /* Class util untuk close animation — durasi lebih panjang & easing yg ngereda halus */
+  .closing-sheet { animation: slideDown 340ms cubic-bezier(0.4, 0, 0.2, 1) forwards; }
+  .closing-backdrop { animation: fadeOut 340ms ease-out forwards; }
+  .closing-fullplayer { animation: slideDown 380ms cubic-bezier(0.4, 0, 0.2, 1) forwards; }
   @keyframes eqBar {
     0%, 100% { height: 30%; }
     50% { height: 100%; }
@@ -1012,6 +1012,7 @@ function renderApp() {
 
   // Overlays
   if (state.fullPlayerOpen) wrap.appendChild(renderFullPlayer());
+  else _wasFullPlayerOpen = false; // Reset flag supaya open berikutnya animasi lagi
   if (state.queueSheetOpen) wrap.appendChild(renderQueueSheet());
   if (state.sleepTimerSheetOpen) wrap.appendChild(renderSleepTimerSheet());
   if (state.contextMenuTrack) wrap.appendChild(renderContextMenu());
@@ -1058,7 +1059,7 @@ function closeSheetWithAnim(overlay, sheet, doneCallback, isFullPlayer = false) 
 
   setTimeout(() => {
     if (typeof doneCallback === 'function') doneCallback();
-  }, isFullPlayer ? 270 : 230);
+  }, isFullPlayer ? 370 : 330);
 }
 
 // ----- Views -----
@@ -2042,11 +2043,25 @@ function renderBottomNav() {
 }
 
 // ----- Full Player -----
+// Track kapan full player pertama kali dibuka. Saat re-render terjadi (misal karena
+// sheet di atasnya ditutup), kita TIDAK animasi slide-up lagi — animasi cuma untuk
+// transisi pertama kali muncul, bukan tiap re-render.
+let _fullPlayerOpenedAt = 0;
+let _wasFullPlayerOpen = false;
+
 function renderFullPlayer() {
   const t = state.currentTrack;
   if (!t) return el('div');
-  // FIX: tambahkan bg-spo-bg dasar + touch-none di luar elemen interaktif
-  const overlay = el('div', 'fixed inset-0 z-40 animate-slide-up overflow-hidden bg-spo-bg');
+  // Deteksi transisi: kalau sebelumnya ditutup, sekarang dibuka → mark timestamp
+  if (!_wasFullPlayerOpen) {
+    _fullPlayerOpenedAt = Date.now();
+  }
+  _wasFullPlayerOpen = true;
+  // Animasi cuma di first render dalam window 500ms — re-render setelahnya: skip
+  const sinceOpen = Date.now() - _fullPlayerOpenedAt;
+  const shouldAnimate = sinceOpen < 500;
+  const animClass = shouldAnimate ? 'animate-slide-up' : '';
+  const overlay = el('div', `fixed inset-0 z-40 ${animClass} overflow-hidden bg-spo-bg`);
   // Helper close-with-animation untuk full player
   const closeFull = () => closeSheetWithAnim(overlay, overlay, () => setState({ fullPlayerOpen: false }), true);
   // Stop tap dari nembus ke layer di belakang
@@ -2094,7 +2109,7 @@ function renderFullPlayer() {
   content.appendChild(middle);
 
   // Lyrics panel (hidden by default)
-  const lyricsPanel = el('div', 'absolute inset-0 px-6 pb-4 overflow-y-auto scroll-y opacity-0 pointer-events-none transition-opacity duration-300');
+  const lyricsPanel = el('div', 'absolute inset-0 px-6 pb-4 overflow-y-auto scroll-y opacity-0 pointer-events-none transition-opacity duration-500');
   lyricsPanel.style.maxHeight = '100%';
   middle.appendChild(lyricsPanel);
 
@@ -2111,11 +2126,18 @@ function renderFullPlayer() {
         lyricsPanel.innerHTML = '';
         if (t.lyricsSynced && t.lyricsSynced.length > 0) {
           // Synced: tiap baris jadi div dengan timestamp
+          // Animasi smooth: opacity + scale + color, durasi panjang (600ms) untuk feel halus
           t.lyricsSynced.forEach((ln, idx) => {
-            const lineEl = el('div', 'py-2 text-lg font-semibold leading-snug text-white/40 transition-colors duration-200 cursor-pointer');
+            const lineEl = el('div', 'lyr-line py-2 px-1 text-lg font-semibold leading-snug cursor-pointer');
             lineEl.dataset.lyrIdx = String(idx);
             lineEl.dataset.lyrTime = String(ln.time);
             lineEl.textContent = ln.text;
+            // Inline style supaya transisi konsisten lintas browser
+            lineEl.style.transition = 'opacity 600ms ease-out, transform 600ms ease-out, color 600ms ease-out';
+            lineEl.style.color = 'rgba(255,255,255,0.35)';
+            lineEl.style.opacity = '0.6';
+            lineEl.style.transform = 'scale(0.96)';
+            lineEl.style.transformOrigin = 'left center';
             lineEl.onclick = () => { audio.currentTime = ln.time; };
             lyricsPanel.appendChild(lineEl);
           });
@@ -2155,14 +2177,34 @@ function renderFullPlayer() {
         lastActiveIdx = activeIdx;
         const lines = lyricsPanel.querySelectorAll('[data-lyr-idx]');
         lines.forEach((ln, i) => {
+          // Distance dari baris aktif (untuk gradient opacity yang halus)
+          const dist = Math.abs(i - activeIdx);
           if (i === activeIdx) {
-            ln.classList.remove('text-white/40');
-            ln.classList.add('text-white', 'text-xl');
+            // Aktif — paling terang, sedikit besar
+            ln.style.color = 'rgba(255,255,255,1)';
+            ln.style.opacity = '1';
+            ln.style.transform = 'scale(1.05)';
+            ln.style.fontWeight = '700';
             // Scroll ke tengah, smooth
             ln.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          } else if (dist === 1) {
+            // Tetangga langsung — agak redup
+            ln.style.color = 'rgba(255,255,255,0.55)';
+            ln.style.opacity = '0.85';
+            ln.style.transform = 'scale(0.98)';
+            ln.style.fontWeight = '600';
+          } else if (dist <= 3) {
+            // Beberapa baris dari aktif — mulai pudar
+            ln.style.color = 'rgba(255,255,255,0.35)';
+            ln.style.opacity = '0.65';
+            ln.style.transform = 'scale(0.96)';
+            ln.style.fontWeight = '600';
           } else {
-            ln.classList.add('text-white/40');
-            ln.classList.remove('text-white', 'text-xl');
+            // Jauh — paling pudar
+            ln.style.color = 'rgba(255,255,255,0.25)';
+            ln.style.opacity = '0.45';
+            ln.style.transform = 'scale(0.94)';
+            ln.style.fontWeight = '600';
           }
         });
       });
@@ -2953,8 +2995,8 @@ window.addEventListener('popstate', (e) => {
   }
 
   _historySyncing = false;
-  // Update depth setelah animasi selesai (animasi take 240ms, kita pakai 280ms untuk safety)
-  setTimeout(() => { _lastHistoryDepth = getOverlayDepth(); }, 300);
+  // Update depth setelah animasi selesai (max 380ms untuk full player)
+  setTimeout(() => { _lastHistoryDepth = getOverlayDepth(); }, 400);
 });
 
 // Subscribe sync history setiap state berubah
