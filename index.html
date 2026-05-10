@@ -89,6 +89,18 @@
     50% { height: 100%; }
   }
 
+  /* Vinyl mode — cover bulat berputar */
+  @keyframes vinylSpin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+  .vinyl-spin {
+    animation: vinylSpin 14s linear infinite;
+  }
+  .vinyl-paused {
+    animation-play-state: paused;
+  }
+
   /* Equalizer animation (sedang main indicator) */
   .eq-bars {
     display: inline-flex;
@@ -420,6 +432,7 @@ const state = {
   queueSheetOpen: false,
   sleepTimerSheetOpen: false,
   eqSheetOpen: false,
+  settingsSheetOpen: false,
   sleepTimerEndsAt: null, // timestamp; null = mati
   sleepTimerEndOfTrack: false,
   contextMenuTrack: null,
@@ -450,6 +463,43 @@ audio.crossOrigin = 'anonymous';
 audio.setAttribute('playsinline', '');
 audio.setAttribute('webkit-playsinline', '');
 let currentObjectUrl = null;
+
+// Secondary audio untuk crossfade (lagu berikutnya start sambil yang ini fade-out)
+const audioB = new Audio();
+audioB.preload = 'metadata';
+audioB.crossOrigin = 'anonymous';
+audioB.setAttribute('playsinline', '');
+audioB.setAttribute('webkit-playsinline', '');
+audioB.volume = 0;
+let audioBObjectUrl = null;
+// Flag: true kalau saat ini lagi proses crossfade
+let _crossfadeActive = false;
+let _crossfadeRAF = null;
+
+// Crossfade settings — di-load dari STORE_META saat startup
+let _crossfadeDuration = 0; // 0 = off, otherwise detik (2-12)
+let _gaplessEnabled = false; // skip natural gap di akhir track (start next lebih cepet)
+let _volumeNormalize = false; // normalize loudness antar track
+let _vinylMode = false; // cover berputar di full player
+let _sleepFadeOut = true; // fade-out volume 30 detik terakhir sebelum sleep timer stop
+
+async function loadAudioSettings() {
+  try {
+    const cf = await dbGet(STORE_META, 'crossfadeDuration');
+    if (cf && typeof cf.value === 'number') _crossfadeDuration = cf.value;
+    const gl = await dbGet(STORE_META, 'gaplessEnabled');
+    if (gl) _gaplessEnabled = !!gl.value;
+    const vn = await dbGet(STORE_META, 'volumeNormalize');
+    if (vn) _volumeNormalize = !!vn.value;
+    const vm = await dbGet(STORE_META, 'vinylMode');
+    if (vm) _vinylMode = !!vm.value;
+    const sf = await dbGet(STORE_META, 'sleepFadeOut');
+    if (sf && sf.value !== undefined) _sleepFadeOut = !!sf.value;
+  } catch (e) {}
+}
+function saveAudioSetting(key, value) {
+  dbPut(STORE_META, { key, value }).catch(() => {});
+}
 
 // =====================================================================
 // Equalizer (Web Audio API, 5-band)
@@ -503,6 +553,55 @@ function ensureEQ() {
     console.warn('EQ init failed:', e);
     _eqContext = null;
     return false;
+  }
+}
+
+function applyVolumeNormalize(track) {
+  // Volume normalization sederhana: kalau track punya hint loudness yang udah diukur,
+  // adjust audio.volume secara proportional. Kalau belum, ukur peak via Web Audio
+  // asynchronously dan simpan ke track untuk dipakai next time.
+  if (!_volumeNormalize) {
+    audio.volume = 1;
+    return;
+  }
+  if (typeof track.peakNorm === 'number') {
+    // peakNorm: 0..1, peak amplitude. Target peak: 0.9
+    // gain = 0.9 / peakNorm, clamp [0.4, 1.5] → tapi audio.volume max 1
+    const gain = Math.min(1.0, Math.max(0.5, 0.9 / Math.max(0.3, track.peakNorm)));
+    audio.volume = gain;
+  } else {
+    // Belum diukur — biarkan default sambil mengukur async
+    audio.volume = 1;
+    measureTrackPeak(track).catch(() => {});
+  }
+}
+
+async function measureTrackPeak(track) {
+  if (track._measuringPeak) return;
+  track._measuringPeak = true;
+  try {
+    // Pakai temporary AudioContext untuk decode + peak detection
+    const arrayBuf = await track.blob.arrayBuffer();
+    const ctx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)
+      ? new (window.AudioContext || window.webkitAudioContext)()
+      : null;
+    if (!ctx) return;
+    const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
+    // Sample peak dari channel pertama dengan stride supaya cepat
+    const ch = audioBuf.getChannelData(0);
+    const stride = Math.max(1, Math.floor(ch.length / 20000));
+    let peak = 0;
+    for (let i = 0; i < ch.length; i += stride) {
+      const v = Math.abs(ch[i]);
+      if (v > peak) peak = v;
+    }
+    track.peakNorm = peak;
+    try { await dbPut(STORE_TRACKS, track); } catch (e) {}
+    try { ctx.close(); } catch (e) {}
+  } catch (e) {
+    console.warn('Peak measure failed for', track.title, e);
+  } finally {
+    track._measuringPeak = false;
   }
 }
 
@@ -570,11 +669,183 @@ audio.addEventListener('ended', () => {
     audio.currentTime = 0;
     audio.play();
   } else {
+    // Kalau crossfade udah selesai (audioB udah jadi current), skip natural next
+    // karena startCrossfade() udah handle transition-nya
+    if (_crossfadeJustFinished) {
+      _crossfadeJustFinished = false;
+      return;
+    }
     nextTrack();
   }
 });
 audio.addEventListener('play', () => { setState({ isPlaying: true }); });
 audio.addEventListener('pause', () => { setState({ isPlaying: false }); });
+
+// Monitor sisa waktu untuk trigger crossfade
+audio.addEventListener('timeupdate', () => {
+  maybeStartCrossfade();
+});
+
+let _crossfadeJustFinished = false;
+let _crossfadeTriggered = false; // anti double-trigger per track
+
+function maybeStartCrossfade() {
+  if (_crossfadeActive || _crossfadeTriggered) return;
+  if (!audio.duration || isNaN(audio.duration)) return;
+  if (state.repeat === 'one') return;
+  // Kalau ada sleep timer "akhir lagu", skip crossfade — biarkan ended normal
+  if (state.sleepTimerEndOfTrack) return;
+
+  // Tentukan window crossfade: pakai _crossfadeDuration kalau >0,
+  // atau 0.5 detik kalau gapless enabled (mini-crossfade untuk hilangkan jeda alami)
+  let cfWindow = _crossfadeDuration;
+  if (cfWindow <= 0) {
+    if (_gaplessEnabled) cfWindow = 0.5;
+    else return;
+  }
+
+  const remaining = audio.duration - audio.currentTime;
+  if (remaining > cfWindow) return;
+
+  // Cari lagu berikutnya
+  const next = getNextTrackForCrossfade();
+  if (!next) return;
+
+  _crossfadeTriggered = true;
+  startCrossfade(next, cfWindow).catch(e => {
+    console.warn('Crossfade failed:', e);
+    _crossfadeTriggered = false;
+    _crossfadeActive = false;
+  });
+}
+
+function getNextTrackForCrossfade() {
+  if (!state.queue || !state.queue.length) return null;
+  let idx = state.queueIndex + 1;
+  if (idx >= state.queue.length) {
+    if (state.repeat === 'all') idx = 0;
+    else return null;
+  }
+  return state.queue[idx];
+}
+
+async function startCrossfade(nextTrack, durationOverride) {
+  _crossfadeActive = true;
+  const duration = durationOverride != null ? durationOverride : _crossfadeDuration;
+
+  // Setup audioB dengan next track
+  if (audioBObjectUrl) URL.revokeObjectURL(audioBObjectUrl);
+  audioBObjectUrl = URL.createObjectURL(nextTrack.blob);
+  audioB.src = audioBObjectUrl;
+  audioB.volume = 0;
+  audioB.currentTime = 0;
+  try {
+    await audioB.play();
+  } catch (e) {
+    console.warn('AudioB play failed', e);
+    _crossfadeActive = false;
+    _crossfadeTriggered = false;
+    return;
+  }
+
+  // Fade animation pakai requestAnimationFrame supaya smooth
+  const startVolume = audio.volume;
+  const fadeStart = performance.now();
+  const fadeMs = duration * 1000;
+
+  return new Promise((resolve) => {
+    const tick = (now) => {
+      if (!_crossfadeActive) { resolve(); return; }
+      const t = Math.min(1, (now - fadeStart) / fadeMs);
+      // Equal-power crossfade — lebih smooth daripada linear
+      const fadeOutGain = Math.cos(t * Math.PI / 2);
+      const fadeInGain = Math.sin(t * Math.PI / 2);
+      try {
+        audio.volume = Math.max(0, startVolume * fadeOutGain);
+        audioB.volume = Math.min(1, fadeInGain);
+      } catch (e) {}
+      if (t >= 1) {
+        finishCrossfade(nextTrack);
+        resolve();
+        return;
+      }
+      _crossfadeRAF = requestAnimationFrame(tick);
+    };
+    _crossfadeRAF = requestAnimationFrame(tick);
+  });
+}
+
+function finishCrossfade(nextTrack) {
+  // Crossfade selesai: pindah dari audioB ke audio (main).
+  // Catat posisi sekarang di audioB, lalu copy blob URL ke audio main.
+  const currentPositionInB = audioB.currentTime;
+
+  // Flush session dari lagu lama, mulai session baru untuk lagu B
+  flushListeningSession();
+
+  // Tandai supaya 'ended' event dari audio (main) yang akan trigger berikutnya, jangan call nextTrack lagi
+  _crossfadeJustFinished = true;
+
+  // Update state ke next track
+  const oldQueueIndex = state.queueIndex;
+  let newIdx = oldQueueIndex + 1;
+  if (newIdx >= state.queue.length) newIdx = 0;
+  setState({ currentTrack: nextTrack, queueIndex: newIdx });
+
+  // Stop audioB, pindahkan ke audio (main)
+  audioB.pause();
+  if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+  currentObjectUrl = audioBObjectUrl;
+  audioBObjectUrl = null;
+
+  audio.src = currentObjectUrl;
+  audio.volume = 1;
+  // Resume dari posisi yang sama supaya seamless
+  const resumeAt = currentPositionInB;
+  const onLoaded = () => {
+    audio.removeEventListener('loadedmetadata', onLoaded);
+    try { audio.currentTime = resumeAt; } catch (e) {}
+    audio.play().catch(e => console.warn('Resume play failed', e));
+  };
+  audio.addEventListener('loadedmetadata', onLoaded);
+  audio.load();
+
+  // Update Media Session
+  updateMediaSession(nextTrack);
+
+  // Recently played
+  const rp = [nextTrack.id, ...state.recentlyPlayed.filter(id => id !== nextTrack.id)].slice(0, 50);
+  setState({ recentlyPlayed: rp });
+  dbPut(STORE_META, { key: 'recentlyPlayed', value: rp }).catch(() => {});
+
+  // Start session baru
+  startListeningSession(nextTrack.id);
+
+  // Reset flags
+  _crossfadeActive = false;
+  _crossfadeTriggered = false;
+  if (_crossfadeRAF) {
+    cancelAnimationFrame(_crossfadeRAF);
+    _crossfadeRAF = null;
+  }
+}
+
+function cancelCrossfade() {
+  // Dipanggil kalau user manually skip/prev di tengah crossfade
+  _crossfadeActive = false;
+  _crossfadeTriggered = false;
+  if (_crossfadeRAF) {
+    cancelAnimationFrame(_crossfadeRAF);
+    _crossfadeRAF = null;
+  }
+  try { audioB.pause(); } catch (e) {}
+  if (audioBObjectUrl) {
+    URL.revokeObjectURL(audioBObjectUrl);
+    audioBObjectUrl = null;
+  }
+  audio.volume = 1;
+  audioB.volume = 0;
+}
 
 // PENTING: Jangan stop audio saat tab hidden / page hide.
 window.addEventListener('pagehide', () => { /* biarkan audio jalan */ });
@@ -582,14 +853,22 @@ window.addEventListener('blur', () => { /* biarkan audio jalan */ });
 
 async function loadAndPlay(track) {
   if (!track) return;
+  // Cancel crossfade kalau lagi aktif (user manual skip)
+  if (_crossfadeActive) cancelCrossfade();
+  _crossfadeTriggered = false;
+
   // FLUSH session sebelumnya kalau ada — lagu sebelumnya udah selesai didengar
   flushListeningSession();
 
   if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
   currentObjectUrl = URL.createObjectURL(track.blob);
   audio.src = currentObjectUrl;
+  audio.volume = 1; // reset volume kalau bekas crossfade
   setState({ currentTrack: track });
   try { await audio.play(); } catch (e) { console.warn(e); }
+
+  // Apply volume normalize kalau enabled (sederhana: clamp loudness via volume hint)
+  applyVolumeNormalize(track);
 
   // Update Media Session
   updateMediaSession(track);
@@ -624,8 +903,6 @@ async function loadAndPlay(track) {
 // - Saat lagu ganti, di-pause, atau di-flush, save session ke STORE_HISTORY
 //   (asal durationListened >= 5 detik, supaya nggak nge-spam history dengan skip cepet)
 // _currentSession: { id?, trackId, startedAt, lastTickAt, durationListened, lastSavedDuration }
-// - id: nomor record di STORE_HISTORY (di-set setelah first save), supaya update pakai id sama
-// - lastSavedDuration: durasi yang udah ke-save terakhir, untuk decide kapan re-save
 let _currentSession = null;
 let _sessionTickInterval = null;
 let _historyChangedCallbacks = [];
@@ -642,7 +919,6 @@ function notifyHistoryChanged() {
 }
 
 function startListeningSession(trackId) {
-  // Bikin session baru
   _currentSession = {
     id: null,
     trackId,
@@ -657,16 +933,13 @@ function startListeningSession(trackId) {
 
 function tickListeningSession() {
   if (!_currentSession) return;
-  // Cuma increment kalau audio benar-benar playing (bukan paused/buffering)
   if (audio.paused) return;
   const now = Date.now();
   const delta = (now - _currentSession.lastTickAt) / 1000;
-  // Cap delta supaya skip atau sleep/wake nggak nambah jam dengar palsu
   if (delta <= 2) _currentSession.durationListened += delta;
   _currentSession.lastTickAt = now;
 
-  // Periodic save: tiap pertambahan 10 detik, simpan/update ke history
-  // Jadi user lihat stats berubah real-time, gak harus tunggu lagu ganti
+  // Periodic save tiap 10 detik supaya stats muncul cepat tanpa harus ganti lagu
   const gained = _currentSession.durationListened - _currentSession.lastSavedDuration;
   if (_currentSession.durationListened >= 5 && gained >= 10) {
     persistSessionSnapshot();
@@ -699,7 +972,6 @@ async function flushListeningSession() {
   if (!_currentSession) return;
   const s = _currentSession;
   _currentSession = null;
-  // Cuma save kalau durasi >= 5 detik (filter skip cepet)
   if (s.durationListened < 5) return;
   try {
     const record = {
@@ -904,6 +1176,7 @@ function cycleRepeat() {
 
 // ---------- Sleep timer ----------
 let sleepTimerInterval = null;
+let _sleepFadeStarted = false;
 function setSleepTimer(minutes) {
   clearSleepTimer();
   if (minutes === 'end_of_track') {
@@ -912,12 +1185,23 @@ function setSleepTimer(minutes) {
   }
   const endsAt = Date.now() + minutes * 60_000;
   setState({ sleepTimerEndsAt: endsAt, sleepTimerEndOfTrack: false });
+  _sleepFadeStarted = false;
   sleepTimerInterval = setInterval(() => {
-    if (Date.now() >= state.sleepTimerEndsAt) {
+    const remaining = state.sleepTimerEndsAt - Date.now();
+    if (remaining <= 0) {
       audio.pause();
       clearSleepTimer();
+      // Restore volume untuk session berikutnya
+      audio.volume = 1;
+      _sleepFadeStarted = false;
       setState({ sleepTimerEndsAt: null });
     } else {
+      // Sleep fade-out: 30 detik terakhir, fade volume linear ke 0
+      if (_sleepFadeOut && remaining <= 30000 && !_crossfadeActive) {
+        if (!_sleepFadeStarted) _sleepFadeStarted = true;
+        const t = remaining / 30000; // 1 → 0
+        try { audio.volume = Math.max(0.05, t); } catch (e) {}
+      }
       // tick supaya UI update
       subscribers.forEach((cb) => cb(state));
     }
@@ -925,6 +1209,10 @@ function setSleepTimer(minutes) {
 }
 function clearSleepTimer() {
   if (sleepTimerInterval) { clearInterval(sleepTimerInterval); sleepTimerInterval = null; }
+  if (_sleepFadeStarted) {
+    audio.volume = 1;
+    _sleepFadeStarted = false;
+  }
   setState({ sleepTimerEndsAt: null, sleepTimerEndOfTrack: false });
 }
 
@@ -1426,6 +1714,8 @@ async function init() {
   });
   // Load EQ settings (lazy init kalau ada saved gains non-zero)
   loadSavedEQ();
+  // Load v8 audio settings (crossfade, gapless, normalize, vinyl, sleep fade)
+  await loadAudioSettings();
 }
 
 // =====================================================================
@@ -1461,6 +1751,7 @@ function renderApp() {
   if (state.queueSheetOpen) wrap.appendChild(renderQueueSheet());
   if (state.sleepTimerSheetOpen) wrap.appendChild(renderSleepTimerSheet());
   if (state.eqSheetOpen) wrap.appendChild(renderEQSheet());
+  if (state.settingsSheetOpen) wrap.appendChild(renderSettingsSheet());
   if (state.contextMenuTrack) wrap.appendChild(renderContextMenu());
   if (state.importDialogOpen) wrap.appendChild(renderImportDialog());
 
@@ -1950,11 +2241,9 @@ let _statsPeriod = 'week';
 
 async function renderStatsSection(container) {
   // Subscribe ke history changes — auto-refresh saat session baru di-save.
-  // Cuma subscribe sekali per container (pakai flag).
   if (!container._statsSubscribed) {
     container._statsSubscribed = true;
     const unsubscribe = onHistoryChanged(() => {
-      // Cek kalau container masih di DOM (Home masih aktif)
       if (document.body.contains(container)) {
         renderStatsSection(container);
       } else {
@@ -2296,10 +2585,16 @@ function renderLibraryView() {
 
   const header = el('div', 'flex items-center justify-between mb-4');
   header.appendChild(el('h1', 'text-2xl font-bold', 'Koleksi Kamu'));
+  const rightHdr = el('div', 'flex items-center gap-1');
+  const settingsBtn = el('button', 'p-2 hover:bg-white/10 rounded-full transition');
+  settingsBtn.innerHTML = svgIcon('settings', 22);
+  settingsBtn.onclick = () => setState({ settingsSheetOpen: true });
+  rightHdr.appendChild(settingsBtn);
   const importBtn = el('button', 'p-2 hover:bg-white/10 rounded-full transition');
   importBtn.innerHTML = svgIcon('plus', 24);
   importBtn.onclick = () => setState({ importDialogOpen: true });
-  header.appendChild(importBtn);
+  rightHdr.appendChild(importBtn);
+  header.appendChild(rightHdr);
   wrap.appendChild(header);
 
   // Filter chips
@@ -3015,6 +3310,36 @@ function renderFullPlayer() {
   // ke inner container (jauh lebih smooth daripada scrollIntoView yang punya overshoot/jitter)
   const lyricsPanel = el('div', 'absolute inset-0 overflow-hidden opacity-0 pointer-events-none transition-opacity duration-500');
   middle.appendChild(lyricsPanel);
+
+  // === Vinyl Mode: cover bulat di tengah, berputar saat playing ===
+  // Cuma render kalau vinyl mode on dan lyrics belum dibuka
+  if (_vinylMode && cu) {
+    const vinylWrap = el('div', 'absolute inset-0 flex items-center justify-center px-8 pointer-events-none');
+    vinylWrap.classList.add('vinyl-wrap');
+    const vinyl = el('div', 'relative w-full max-w-[300px] aspect-square rounded-full overflow-hidden shadow-2xl');
+    vinyl.style.background = '#000';
+    // Cover sebagai lingkaran
+    const vinylImg = el('div', 'absolute inset-0 rounded-full');
+    vinylImg.style.backgroundImage = `url(${cu})`;
+    vinylImg.style.backgroundSize = 'cover';
+    vinylImg.style.backgroundPosition = 'center';
+    vinyl.appendChild(vinylImg);
+    // Ring tengah hitam untuk vibe vinyl
+    const center = el('div', 'absolute top-1/2 left-1/2 w-8 h-8 -mt-4 -ml-4 rounded-full bg-black border-2 border-white/20');
+    vinyl.appendChild(center);
+    // Spin animation — pakai class CSS yang akan add/remove sesuai isPlaying
+    vinyl.classList.add('vinyl-spin');
+    if (!state.isPlaying) vinyl.classList.add('vinyl-paused');
+    // Subscribe ke isPlaying changes supaya pause/resume tanpa full re-render (jaga rotasi)
+    const unsubVinyl = subscribe(() => {
+      if (!vinyl.isConnected) { unsubVinyl(); return; }
+      if (state.isPlaying) vinyl.classList.remove('vinyl-paused');
+      else vinyl.classList.add('vinyl-paused');
+    });
+    vinylWrap.appendChild(vinyl);
+    middle.appendChild(vinylWrap);
+  }
+
   // Inner scroller — yang akan kita translateY untuk efek auto-scroll super halus
   const lyricsInner = el('div', 'absolute left-0 right-0 px-6 will-change-transform');
   lyricsInner.style.top = '50%';
@@ -3571,6 +3896,129 @@ function renderEQSheet() {
   overlay.appendChild(sheet);
   return overlay;
 }
+
+// =====================================================================
+// Settings Sheet (Pengaturan audio: crossfade, gapless, normalize, vinyl, sleep fade)
+// =====================================================================
+function renderSettingsSheet() {
+  const overlay = el('div', 'fixed inset-0 z-[60] flex flex-col sheet-backdrop settings-sheet-overlay');
+  const sheet = el('div', 'bg-spo-sheet rounded-t-2xl animate-slide-up safe-bottom max-h-[85vh] overflow-y-auto scroll-y');
+  const doClose = () => closeSheetWithAnim(overlay, sheet, () => setState({ settingsSheetOpen: false }));
+  overlay.onclick = (e) => { if (e.target === overlay) doClose(); };
+  overlay.appendChild(el('div', 'flex-1'));
+
+  // Handle
+  sheet.appendChild(el('div', 'flex justify-center pt-2 pb-1',));
+  sheet.lastChild.innerHTML = '<div class="w-10 h-1 bg-white/40 rounded-full"></div>';
+
+  // Header
+  const hd = el('div', 'flex items-center justify-between px-5 py-3 border-b border-white/10');
+  hd.appendChild(el('div', 'text-lg font-bold', 'Pengaturan'));
+  const closeBtn = el('button', 'w-9 h-9 flex items-center justify-center rounded-full hover:bg-white/10');
+  closeBtn.innerHTML = svgIcon('close', 20);
+  closeBtn.onclick = (e) => { e.stopPropagation(); doClose(); };
+  hd.appendChild(closeBtn);
+  sheet.appendChild(hd);
+
+  // ===== Section: Pemutaran =====
+  const sec1 = el('div', 'px-5 pt-4 pb-2 text-xs uppercase tracking-wider text-spo-textMuted', 'Pemutaran');
+  sheet.appendChild(sec1);
+
+  // --- Crossfade ---
+  const cfRow = el('div', 'px-5 py-3');
+  const cfTop = el('div', 'flex items-center justify-between mb-1');
+  cfTop.appendChild(el('div', 'font-semibold', 'Crossfade antar lagu'));
+  const cfVal = el('div', 'text-sm text-spo-textMuted', _crossfadeDuration > 0 ? `${_crossfadeDuration} detik` : 'Mati');
+  cfTop.appendChild(cfVal);
+  cfRow.appendChild(cfTop);
+  cfRow.appendChild(el('div', 'text-xs text-spo-textMuted mb-2', 'Lagu sebelumnya fade-out sambil lagu berikutnya fade-in. Equal-power untuk transisi seamless.'));
+  const cfSlider = el('input', 'w-full');
+  cfSlider.type = 'range';
+  cfSlider.min = '0';
+  cfSlider.max = '12';
+  cfSlider.step = '1';
+  cfSlider.value = String(_crossfadeDuration);
+  cfSlider.style.accentColor = '#1DB954';
+  cfSlider.oninput = () => {
+    _crossfadeDuration = parseInt(cfSlider.value);
+    cfVal.textContent = _crossfadeDuration > 0 ? `${_crossfadeDuration} detik` : 'Mati';
+    saveAudioSetting('crossfadeDuration', _crossfadeDuration);
+  };
+  cfRow.appendChild(cfSlider);
+  sheet.appendChild(cfRow);
+
+  // --- Gapless ---
+  const glRow = makeToggleRow('Gapless playback', 'Mulai lagu berikutnya 0.5 detik lebih awal, hilangkan jeda alami. Cocok untuk album live.', _gaplessEnabled, (v) => {
+    _gaplessEnabled = v;
+    saveAudioSetting('gaplessEnabled', v);
+  });
+  sheet.appendChild(glRow);
+
+  // --- Volume normalization ---
+  const vnRow = makeToggleRow('Normalisasi volume', 'Samain loudness antar lagu supaya gak ada yang tiba-tiba kecil/keras. Diukur otomatis saat pertama putar.', _volumeNormalize, (v) => {
+    _volumeNormalize = v;
+    saveAudioSetting('volumeNormalize', v);
+    if (state.currentTrack) applyVolumeNormalize(state.currentTrack);
+  });
+  sheet.appendChild(vnRow);
+
+  // ===== Section: Tampilan =====
+  const sec2 = el('div', 'px-5 pt-4 pb-2 text-xs uppercase tracking-wider text-spo-textMuted', 'Tampilan');
+  sheet.appendChild(sec2);
+
+  // --- Vinyl mode ---
+  const vmRow = makeToggleRow('Mode Vinyl', 'Cover lagu jadi piringan bulat dan berputar pelan di pemutar penuh.', _vinylMode, (v) => {
+    _vinylMode = v;
+    saveAudioSetting('vinylMode', v);
+    // Re-render kalau lagi di full player supaya langsung kelihatan
+    if (state.fullPlayerOpen) subscribers.forEach((cb) => cb(state));
+  });
+  sheet.appendChild(vmRow);
+
+  // ===== Section: Sleep Timer =====
+  const sec3 = el('div', 'px-5 pt-4 pb-2 text-xs uppercase tracking-wider text-spo-textMuted', 'Pengatur Waktu Tidur');
+  sheet.appendChild(sec3);
+
+  // --- Sleep fade-out ---
+  const sfRow = makeToggleRow('Fade-out saat akan tidur', 'Volume fade ke 0 di 30 detik terakhir sebelum sleep timer stop. Jangan kaget pas matiin.', _sleepFadeOut, (v) => {
+    _sleepFadeOut = v;
+    saveAudioSetting('sleepFadeOut', v);
+  });
+  sheet.appendChild(sfRow);
+
+  // Padding bawah
+  sheet.appendChild(el('div', 'h-8'));
+
+  overlay.appendChild(sheet);
+  return overlay;
+}
+
+function makeToggleRow(title, desc, initialValue, onChange) {
+  const row = el('div', 'flex items-start gap-3 px-5 py-3');
+  const text = el('div', 'flex-1 min-w-0');
+  text.appendChild(el('div', 'font-semibold', title));
+  text.appendChild(el('div', 'text-xs text-spo-textMuted mt-0.5', desc));
+  row.appendChild(text);
+  const switchEl = el('button', `flex-shrink-0 w-12 h-7 rounded-full transition-colors relative ${initialValue ? 'bg-spo-green' : 'bg-white/20'}`);
+  const knob = el('div', `absolute top-1 w-5 h-5 rounded-full bg-white shadow transition-all ${initialValue ? 'left-6' : 'left-1'}`);
+  switchEl.appendChild(knob);
+  let val = initialValue;
+  switchEl.onclick = (e) => {
+    e.stopPropagation();
+    val = !val;
+    if (val) {
+      switchEl.classList.remove('bg-white/20'); switchEl.classList.add('bg-spo-green');
+      knob.classList.remove('left-1'); knob.classList.add('left-6');
+    } else {
+      switchEl.classList.add('bg-white/20'); switchEl.classList.remove('bg-spo-green');
+      knob.classList.add('left-1'); knob.classList.remove('left-6');
+    }
+    onChange(val);
+  };
+  row.appendChild(switchEl);
+  return row;
+}
+
 function renderContextMenu() {
   const t = state.contextMenuTrack;
   const overlay = el('div', 'fixed inset-0 z-[55] flex flex-col sheet-backdrop');
@@ -3860,6 +4308,8 @@ function svgIcon(name, size = 24) {
     trash: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v5M14 11v5"/></svg>`,
     close: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`,
     equalizer: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 4v6M6 14v6M12 4v3M12 11v9M18 4v9M18 13v7"/><circle cx="6" cy="12" r="2"/><circle cx="12" cy="9" r="2"/><circle cx="18" cy="11" r="2"/></svg>`,
+    settings: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>`,
+    waves: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12c1.5-2 3-2 4.5 0s3 2 4.5 0 3-2 4.5 0 3 2 4.5 0M2 18c1.5-2 3-2 4.5 0s3 2 4.5 0 3-2 4.5 0 3 2 4.5 0M2 6c1.5-2 3-2 4.5 0s3 2 4.5 0 3-2 4.5 0 3 2 4.5 0"/></svg>`,
   };
   return icons[name] || `<svg width="${s}" height="${s}" viewBox="0 0 24 24"></svg>`;
 }
@@ -3896,6 +4346,7 @@ function getOverlayDepth() {
   if (state.queueSheetOpen) d++;
   if (state.sleepTimerSheetOpen) d++;
   if (state.eqSheetOpen) d++;
+  if (state.settingsSheetOpen) d++;
   if (state.contextMenuTrack) d++;
   return d;
 }
@@ -4003,6 +4454,8 @@ window.addEventListener('popstate', (e) => {
   // Tutup yang paling depan (urutan prioritas)
   if (state.contextMenuTrack) {
     animateAndClose('.fixed.inset-0.z-\\[55\\]', '.bg-spo-sheet', { contextMenuTrack: null });
+  } else if (state.settingsSheetOpen) {
+    animateAndClose('.fixed.inset-0.settings-sheet-overlay', '.bg-spo-sheet', { settingsSheetOpen: false });
   } else if (state.eqSheetOpen) {
     animateAndClose('.fixed.inset-0.eq-sheet-overlay', '.bg-spo-sheet', { eqSheetOpen: false });
   } else if (state.sleepTimerSheetOpen) {
