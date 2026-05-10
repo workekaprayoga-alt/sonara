@@ -1,55 +1,41 @@
-# Sonara v3 — Bug Fixes
+# Sonara v4 — Bug Fixes (lanjutan)
 
-Fokus rilis ini: stabilkan playback dan UI.
+Fokus rilis ini: tombol kembali, navigasi sheet, dan keyboard pencarian.
 
-## Bug yang diperbaiki
+## Bug yang diperbaiki di v4
 
-### Bug 1: Musik mati saat tekan Home / minimize
-**Penyebab:** Kombinasi — wake lock kurang kuat, MediaSession kurang lengkap, dan beberapa sinyal ke OS hilang saat Chrome dipindah ke background.
+### Bug 3: Tombol Kembali Android matiin musik
+**Penyebab:** Sonara dianggap browser sebagai "halaman tunggal". Tekan tombol kembali = keluar app = Chrome bunuh prosesnya = audio mati.
 
-**Fix di kode:**
-- MediaSession lengkap: handler `play`, `pause`, `prev`, `next`, `seek`, `stop`
-- `playbackState` aktif disinkron ke OS — bantu Android/iOS mengenali audio aktif
-- Position state dikirim 1x/detik — progress bar di lock screen akurat
-- Wake lock di-acquire saat play, di-release saat pause
-- Wake lock di-re-acquire otomatis saat tab balik visible
-- Audio attribute `playsinline` + `webkit-playsinline` (penting di iOS)
-- Tidak ada handler yang pause audio karena visibility change
+**Fix:** History API integration.
+- Tiap kali ada overlay terbuka (full player, antrean, sleep timer, context menu, atau sub-view album/artis/playlist), Sonara push 1 entry ke browser history.
+- Tekan tombol kembali Android → popstate event → Sonara tutup overlay paling atas, BUKAN keluar app.
+- Urutan prioritas tutup (paling depan dulu): context menu (⋯) → sleep timer → antrean → full player → sub-view → tab utama.
+- Saat di tab utama (Home/Cari/Koleksi), tekan kembali baru benar-benar keluar app — tapi karena audio masih main di background (kalau battery optimization udah unrestricted), musik tetap jalan.
 
-**CATATAN PENTING:** Kalau setelah update musik MASIH mati saat Home/minimize, kemungkinan besar **battery optimization HP-mu yang bunuh Chrome**. Cara fix di sisi HP:
+### Bug 4: Sheet Antrean & Sleep Timer susah ditutup
+**Penyebab:** Sheet hanya bisa ditutup dengan tap di backdrop (area gelap luar sheet). User nggak tahu / nggak respon → stuck.
 
-1. Settings HP → Apps → Chrome
-2. Cari Battery / Battery usage
-3. Set ke Unrestricted / Tidak dibatasi
+**Fix:** Tambah tombol close (X) eksplisit di:
+- Header sheet **Antrean** (kanan atas)
+- Header sheet **Pengatur waktu tidur** (kanan atas)
+- Header **menu konteks lagu** (tombol ⋯)
+- Tombol kembali Android juga bisa tutup sheet ini (Bug 3 fix).
 
-HP merk tertentu butuh langkah ekstra:
-- Xiaomi/MIUI: Settings → Apps → Manage apps → Chrome → Battery saver → No restrictions
-- Oppo/Realme: Settings → Battery → App battery management → Chrome → Allow background activity ON
-- Vivo: Settings → Battery → Background power consumption → Chrome → Allow
-- Huawei: Settings → Apps → Chrome → Battery → Launch → Manage manually (ON semua)
-- Samsung: Settings → Apps → Chrome → Battery → Unrestricted
+### Bug 5: Keyboard tutup tiap ketik 1 huruf di pencarian
+**Penyebab:** Tiap ketik huruf → `setState({ search })` → seluruh aplikasi re-render → element input keganti dengan element baru → keyboard kehilangan focus → keyboard tutup.
 
-PWA jalan di dalam Chrome, jadi setting yang dipakai adalah setting Chrome, bukan "Sonara" (Sonara nggak punya entry sendiri di Settings).
-
-### Bug 2: Menu loncat-loncat saat buka full player
-**Penyebab:** Tiap detik, audio `timeupdate` event memanggil `setState({ currentTime })` yang nge-trigger render full DOM rebuild. Saat user tap, element yang harusnya nerima tap udah keganti dengan element baru — tap "lewat" atau menu kelihatan loncat-loncat.
-
-**Fix:**
-- `currentTime` & `duration` dipisahkan dari state-yang-trigger-render
-- Time updates pakai event-emitter terpisah
-- Mini player progress bar update via DOM langsung, tidak re-render
-- Full player progress + time labels update via DOM langsung
-- Slider tidak "loncat balik" saat user pegang
-- Debounce tap mini player 400ms → 500ms
-
-Hasil: full player open sekali, tetap stabil, tap responsif.
+**Fix:** Search query disimpan di local variable, BUKAN state.
+- Ketik huruf tidak trigger global re-render — input tetap focused.
+- Hasil pencarian update via DOM patch lokal di section results aja.
+- Debounce 120ms supaya pengetikan cepat tidak rebuild list per huruf.
+- Hasil: keyboard tetap kebuka selama ngetik, dan list update secara live.
 
 ## Update lain
-- Service Worker `sonara-v4` (auto-fetch update baru)
-- index.html network-first — kalau ada deploy baru, langsung dapet versi terbaru
+- Service Worker dinaikkan ke `sonara-v5` supaya HP auto-fetch versi baru.
 
 ## Cara update di HP setelah deploy
-1. Update 5 file di GitHub (index.html, sw.js, manifest.json, 2 icon)
+1. Update 6 file di GitHub (index.html, sw.js, manifest.json, icon-192, icon-512, CHANGELOG.md)
 2. Tunggu Vercel re-deploy (~30 detik)
 3. Di HP: buka Sonara dari home screen
 4. Service worker baru otomatis install di background
@@ -57,3 +43,11 @@ Hasil: full player open sekali, tetap stabil, tap responsif.
 
 Kalau masih versi lama setelah dibuka ulang:
 - Tekan lama icon Sonara di home screen → App info → Storage → Clear cache (JANGAN clear data — itu hapus lagu)
+
+## Test checklist setelah update
+- ✅ Tekan tombol kembali saat full player terbuka → full player tutup, musik tetap jalan
+- ✅ Tekan tombol kembali saat di sheet Antrean → sheet tutup
+- ✅ Tekan tombol kembali saat di Album/Artis → balik ke Koleksi
+- ✅ Tombol X muncul di kanan atas sheet Antrean & Sleep Timer
+- ✅ Buka pencarian, ketik panjang → keyboard tetap kebuka, hasil muncul live
+- ✅ Tekan Home → musik tetap jalan (asal battery optimization Chrome = Unrestricted)

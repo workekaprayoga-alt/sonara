@@ -961,6 +961,8 @@ function getGreeting() {
 }
 
 // ----- Search -----
+// Local query: nggak masuk state, jadi ketik nggak trigger render → keyboard nggak tutup
+let _searchQuery = '';
 function renderSearchView() {
   const wrap = el('div', 'p-4 pb-32');
   wrap.appendChild(el('h1', 'text-2xl font-bold mb-4', 'Cari'));
@@ -968,52 +970,65 @@ function renderSearchView() {
   const search = el('input', 'w-full bg-spo-elevated text-white px-4 py-3 rounded-md outline-none placeholder-spo-textMuted');
   search.type = 'search';
   search.placeholder = 'Cari lagu, artis, atau album';
-  search.value = state.search;
-  search.oninput = (e) => setState({ search: e.target.value });
+  search.value = _searchQuery;
+  // Auto-focus saat pertama buka view, supaya user bisa langsung ketik
+  setTimeout(() => { try { if (document.activeElement !== search) {/* don't steal focus if user already focused elsewhere */} } catch(e){} }, 50);
   wrap.appendChild(search);
 
-  if (!state.search) {
-    // Browse: artists & albums
-    const artists = [...new Set(state.tracks.map(t => t.artist).filter(a => a && a !== 'Unknown Artist'))];
-    const albums = [...new Set(state.tracks.map(t => t.album).filter(a => a && a !== 'Unknown Album'))];
+  // Container hasil — kita patch DOM-nya, BUKAN re-render whole view
+  const resultsBox = el('div', '');
+  wrap.appendChild(resultsBox);
 
-    if (artists.length > 0) {
-      wrap.appendChild(el('h2', 'text-lg font-bold mt-6 mb-3', 'Artis'));
-      const grid = el('div', 'grid grid-cols-2 gap-3');
-      artists.slice(0, 10).forEach(a => {
-        grid.appendChild(renderArtistCard(a));
-      });
-      wrap.appendChild(grid);
-    }
+  function renderResults() {
+    resultsBox.innerHTML = '';
+    if (!_searchQuery) {
+      // Browse: artists & albums
+      const artists = [...new Set(state.tracks.map(t => t.artist).filter(a => a && a !== 'Unknown Artist'))];
+      const albums = [...new Set(state.tracks.map(t => t.album).filter(a => a && a !== 'Unknown Album'))];
 
-    if (albums.length > 0) {
-      wrap.appendChild(el('h2', 'text-lg font-bold mt-6 mb-3', 'Album'));
-      const grid = el('div', 'grid grid-cols-2 gap-3');
-      albums.slice(0, 10).forEach(a => {
-        grid.appendChild(renderAlbumCard(a));
-      });
-      wrap.appendChild(grid);
+      if (artists.length > 0) {
+        resultsBox.appendChild(el('h2', 'text-lg font-bold mt-6 mb-3', 'Artis'));
+        const grid = el('div', 'grid grid-cols-2 gap-3');
+        artists.slice(0, 10).forEach(a => grid.appendChild(renderArtistCard(a)));
+        resultsBox.appendChild(grid);
+      }
+      if (albums.length > 0) {
+        resultsBox.appendChild(el('h2', 'text-lg font-bold mt-6 mb-3', 'Album'));
+        const grid = el('div', 'grid grid-cols-2 gap-3');
+        albums.slice(0, 10).forEach(a => grid.appendChild(renderAlbumCard(a)));
+        resultsBox.appendChild(grid);
+      }
+      return;
     }
-    return wrap;
+    const q = _searchQuery.toLowerCase();
+    const matched = state.tracks.filter(t =>
+      t.title.toLowerCase().includes(q) ||
+      t.artist.toLowerCase().includes(q) ||
+      t.album.toLowerCase().includes(q)
+    );
+    if (matched.length === 0) {
+      resultsBox.appendChild(el('div', 'text-center text-spo-textMuted mt-12', 'Tidak ada hasil'));
+      return;
+    }
+    resultsBox.appendChild(el('h2', 'text-lg font-bold mt-6 mb-3', `${matched.length} lagu`));
+    const list = el('div', 'flex flex-col');
+    matched.forEach((t, i) => list.appendChild(renderTrackRow(t, i, matched, { type: 'library', name: 'Hasil pencarian' })));
+    resultsBox.appendChild(list);
   }
 
-  // Search results
-  const q = state.search.toLowerCase();
-  const matchedTracks = state.tracks.filter(t =>
-    t.title.toLowerCase().includes(q) ||
-    t.artist.toLowerCase().includes(q) ||
-    t.album.toLowerCase().includes(q)
-  );
+  // Debounce kecil supaya pengetikan cepat nggak ngeri-rebuild list per huruf
+  let searchDebounce = null;
+  search.oninput = (e) => {
+    _searchQuery = e.target.value;
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => {
+      // Render hasil tanpa setState — input tetap focused, keyboard tetap kebuka
+      renderResults();
+    }, 120);
+  };
 
-  if (matchedTracks.length === 0) {
-    wrap.appendChild(el('div', 'text-center text-spo-textMuted mt-12', 'Tidak ada hasil'));
-    return wrap;
-  }
-
-  wrap.appendChild(el('h2', 'text-lg font-bold mt-6 mb-3', `${matchedTracks.length} lagu`));
-  const list = el('div', 'flex flex-col');
-  matchedTracks.forEach((t, i) => list.appendChild(renderTrackRow(t, i, matchedTracks, { type: 'library', name: 'Hasil pencarian' })));
-  wrap.appendChild(list);
+  // Initial render hasil
+  renderResults();
   return wrap;
 }
 
@@ -1874,8 +1889,14 @@ function renderQueueSheet() {
   sheet.appendChild(handle);
 
   // Header
-  const header = el('div', 'px-5 pt-2 pb-3');
-  header.appendChild(el('h2', 'text-2xl font-bold', 'Antrean'));
+  const header = el('div', 'px-5 pt-2 pb-3 relative');
+  // Close button (X) — eksplisit, gampang di-tap
+  const closeBtn = el('button', 'absolute top-2 right-3 w-9 h-9 flex items-center justify-center rounded-full hover:bg-white/10 active:bg-white/20');
+  closeBtn.innerHTML = svgIcon('close', 22);
+  closeBtn.setAttribute('aria-label', 'Tutup');
+  closeBtn.onclick = (e) => { e.stopPropagation(); setState({ queueSheetOpen: false }); };
+  header.appendChild(closeBtn);
+  header.appendChild(el('h2', 'text-2xl font-bold pr-10', 'Antrean'));
   header.appendChild(el('div', 'text-sm', `Memutar `));
   const ctx = state.queueContext;
   if (ctx) {
@@ -2013,8 +2034,15 @@ function renderSleepTimerSheet() {
   // Handle
   sheet.appendChild(el('div', 'flex justify-center pt-2 pb-2',));
   sheet.lastChild.innerHTML = '<div class="w-10 h-1 bg-white/40 rounded-full"></div>';
-  // Title
-  sheet.appendChild(el('div', 'text-center font-bold py-3 border-b border-white/10', 'Pengatur waktu tidur'));
+  // Title row dengan tombol close
+  const titleRow = el('div', 'relative py-3 border-b border-white/10');
+  titleRow.appendChild(el('div', 'text-center font-bold', 'Pengatur waktu tidur'));
+  const closeSlp = el('button', 'absolute top-1/2 right-3 -translate-y-1/2 w-9 h-9 flex items-center justify-center rounded-full hover:bg-white/10 active:bg-white/20');
+  closeSlp.innerHTML = svgIcon('close', 20);
+  closeSlp.setAttribute('aria-label', 'Tutup');
+  closeSlp.onclick = (e) => { e.stopPropagation(); setState({ sleepTimerSheetOpen: false }); };
+  titleRow.appendChild(closeSlp);
+  sheet.appendChild(titleRow);
 
   const opts = [
     { label: '5 menit', val: 5 },
@@ -2065,6 +2093,12 @@ function renderContextMenu() {
   meta.appendChild(el('div', 'font-bold truncate', t.title));
   meta.appendChild(el('div', 'text-sm text-spo-textMuted truncate', `${t.artist} • ${t.album}`));
   head.appendChild(meta);
+  // Close button
+  const closeCtx = el('button', 'flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-full hover:bg-white/10 active:bg-white/20');
+  closeCtx.innerHTML = svgIcon('close', 20);
+  closeCtx.setAttribute('aria-label', 'Tutup');
+  closeCtx.onclick = (e) => { e.stopPropagation(); setState({ contextMenuTrack: null }); };
+  head.appendChild(closeCtx);
   sheet.appendChild(head);
 
   const items = [
@@ -2254,6 +2288,88 @@ function svgIcon(name, size = 24) {
 // =====================================================================
 subscribe(() => render());
 init().then(() => render());
+
+// =====================================================================
+// History API: tombol kembali Android = tutup overlay, BUKAN keluar app
+// =====================================================================
+// Strategi: tiap kali ada overlay/sheet/sub-view yang terbuka, push 1 entry
+// ke history. Saat user tekan tombol kembali → popstate fired → kita tutup
+// overlay teratas, dan history TIDAK pop ke luar app.
+//
+// Yang kita track (urutan = prioritas tutup, paling depan dulu):
+// 1. contextMenuTrack    — track ⋯ menu
+// 2. sleepTimerSheetOpen — sleep timer
+// 3. queueSheetOpen      — antrean
+// 4. fullPlayerOpen      — full player
+// 5. view sub-view       — album/artist/playlist (bukan home/search/library)
+
+let _historySyncing = false;
+let _lastHistoryDepth = 0;
+
+function getOverlayDepth() {
+  let d = 0;
+  // sub-view (album/artist/playlist) hitungan 1 kalau bukan tab utama
+  const mainTabs = ['home', 'search', 'library'];
+  if (state.view && !mainTabs.includes(state.view)) d++;
+  if (state.fullPlayerOpen) d++;
+  if (state.queueSheetOpen) d++;
+  if (state.sleepTimerSheetOpen) d++;
+  if (state.contextMenuTrack) d++;
+  return d;
+}
+
+function syncHistory() {
+  if (_historySyncing) return;
+  const depth = getOverlayDepth();
+  if (depth > _lastHistoryDepth) {
+    // Tambah entries baru
+    _historySyncing = true;
+    for (let i = _lastHistoryDepth; i < depth; i++) {
+      history.pushState({ sonara: true, depth: i + 1 }, '');
+    }
+    _historySyncing = false;
+  } else if (depth < _lastHistoryDepth) {
+    // Pop entries — back() depthDiff kali. Tapi jangan call back kalau popstate-nya yg trigger ini.
+    // Kita handle implisit: popstate listener udah ngubah state, jadi disini cukup update _lastHistoryDepth.
+  }
+  _lastHistoryDepth = depth;
+}
+
+window.addEventListener('popstate', (e) => {
+  // Tombol kembali ditekan. Tutup overlay paling atas.
+  const depth = getOverlayDepth();
+  if (depth === 0) {
+    // Tidak ada overlay — biarin browser handle (keluar app / kembali web history)
+    _lastHistoryDepth = 0;
+    return;
+  }
+  _historySyncing = true;
+  // Tutup yang paling depan (urutan prioritas)
+  if (state.contextMenuTrack) {
+    setState({ contextMenuTrack: null });
+  } else if (state.sleepTimerSheetOpen) {
+    setState({ sleepTimerSheetOpen: false });
+  } else if (state.queueSheetOpen) {
+    setState({ queueSheetOpen: false });
+  } else if (state.fullPlayerOpen) {
+    setState({ fullPlayerOpen: false });
+  } else {
+    const mainTabs = ['home', 'search', 'library'];
+    if (state.view && !mainTabs.includes(state.view)) {
+      // Kembali ke library (parent natural untuk album/artist/playlist)
+      setState({ view: 'library', viewParam: null });
+    }
+  }
+  _historySyncing = false;
+  _lastHistoryDepth = getOverlayDepth();
+});
+
+// Subscribe sync history setiap state berubah
+subscribe(() => syncHistory());
+
+// Init: push 1 sentinel state supaya popstate pertama nggak langsung keluar app
+// (kalau user tekan back saat di main tab, history.back() akan trigger ini, bukan keluar)
+history.replaceState({ sonara: true, depth: 0, root: true }, '');
 
 // Service worker — dengan auto-update saat ada versi baru
 if ('serviceWorker' in navigator) {
