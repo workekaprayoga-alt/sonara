@@ -141,6 +141,31 @@
     border: none;
   }
 
+  /* Equalizer vertical slider — pakai accent-color modern (Chrome/Firefox/Safari support) */
+  .eq-slider {
+    accent-color: #1db954;
+    cursor: pointer;
+  }
+  /* Tambah thumb yang lebih besar untuk touch */
+  .eq-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: #1db954;
+    cursor: pointer;
+    border: 2px solid #fff;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+  }
+  .eq-slider::-moz-range-thumb {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: #1db954;
+    cursor: pointer;
+    border: 2px solid #fff;
+  }
+
   /* Bottom sheet backdrop */
   .sheet-backdrop {
     background: rgba(0,0,0,0.6);
@@ -385,6 +410,7 @@ const state = {
   fullPlayerOpen: false,
   queueSheetOpen: false,
   sleepTimerSheetOpen: false,
+  eqSheetOpen: false,
   sleepTimerEndsAt: null, // timestamp; null = mati
   sleepTimerEndOfTrack: false,
   contextMenuTrack: null,
@@ -415,6 +441,94 @@ audio.crossOrigin = 'anonymous';
 audio.setAttribute('playsinline', '');
 audio.setAttribute('webkit-playsinline', '');
 let currentObjectUrl = null;
+
+// =====================================================================
+// Equalizer (Web Audio API, 5-band)
+// =====================================================================
+// 5 BiquadFilters chained: bass (60Hz), low-mid (250Hz), mid (1kHz), high-mid (4kHz), treble (12kHz).
+// Init lazy: cuma jalankan saat user pertama kali buka EQ — supaya tidak konflik dengan
+// MediaSession/background playback yang kadang sensitif terhadap AudioContext.
+const EQ_BANDS = [
+  { freq: 60, type: 'lowshelf' },
+  { freq: 250, type: 'peaking' },
+  { freq: 1000, type: 'peaking' },
+  { freq: 4000, type: 'peaking' },
+  { freq: 12000, type: 'highshelf' },
+];
+const EQ_PRESETS = {
+  'Normal':       [0, 0, 0, 0, 0],
+  'Bass Booster': [8, 5, 0, -1, -2],
+  'Treble Boost': [-2, -1, 0, 4, 7],
+  'Vocal Boost':  [-2, 0, 4, 5, 1],
+  'Pop':          [-1, 2, 4, 2, -1],
+  'Rock':         [5, 3, -1, 2, 4],
+  'Jazz':         [3, 2, 0, 2, 3],
+  'Classical':    [3, 2, -2, 2, 4],
+  'Electronic':   [4, 2, 0, 2, 4],
+};
+let _eqContext = null;
+let _eqFilters = [];
+let _eqSource = null;
+let _eqGains = [0, 0, 0, 0, 0]; // dB per band
+let _eqPreset = 'Normal';
+
+function ensureEQ() {
+  if (_eqContext) return true;
+  try {
+    _eqContext = new (window.AudioContext || window.webkitAudioContext)();
+    _eqSource = _eqContext.createMediaElementSource(audio);
+    _eqFilters = EQ_BANDS.map(band => {
+      const f = _eqContext.createBiquadFilter();
+      f.type = band.type;
+      f.frequency.value = band.freq;
+      f.Q.value = 1;
+      f.gain.value = 0;
+      return f;
+    });
+    // Chain: source → f0 → f1 → ... → destination
+    let prev = _eqSource;
+    for (const f of _eqFilters) { prev.connect(f); prev = f; }
+    prev.connect(_eqContext.destination);
+    return true;
+  } catch (e) {
+    console.warn('EQ init failed:', e);
+    _eqContext = null;
+    return false;
+  }
+}
+
+function applyEQ(gains) {
+  if (!_eqContext) {
+    if (!ensureEQ()) return;
+  }
+  // AudioContext kadang suspended di mobile sampai user gesture
+  if (_eqContext.state === 'suspended') _eqContext.resume().catch(() => {});
+  for (let i = 0; i < _eqFilters.length; i++) {
+    const targetGain = gains[i] || 0;
+    // Smooth ramp 100ms supaya nggak ada "klik" saat ganti
+    _eqFilters[i].gain.setTargetAtTime(targetGain, _eqContext.currentTime, 0.05);
+  }
+  _eqGains = gains.slice();
+  // Persist ke meta store
+  dbPut(STORE_META, { key: 'eqGains', value: gains }).catch(() => {});
+  dbPut(STORE_META, { key: 'eqPreset', value: _eqPreset }).catch(() => {});
+}
+
+// Load saved EQ on startup
+async function loadSavedEQ() {
+  try {
+    const g = await dbGet(STORE_META, 'eqGains');
+    const p = await dbGet(STORE_META, 'eqPreset');
+    if (p && p.value) _eqPreset = p.value;
+    if (g && g.value && Array.isArray(g.value)) {
+      _eqGains = g.value;
+      // Hanya init EQ kalau ada gain non-zero, supaya nggak waste resource untuk preset Normal
+      if (g.value.some(v => v !== 0)) {
+        applyEQ(g.value);
+      }
+    }
+  } catch(e) {}
+}
 
 // Time/duration updates pakai event-emitter terpisah supaya nggak trigger re-render UI.
 // UI (mini player, full player) listen lewat onTimeUpdate dan patch DOM langsung.
@@ -685,6 +799,97 @@ function coverUrl(track) {
   return url;
 }
 
+// =====================================================================
+// Dominant Color Extraction (untuk Color Theme Adaptif di Full Player)
+// =====================================================================
+// Extract warna dominan + warna sekunder dari image, balik 2 warna untuk gradient.
+// Cache hasil per track ID supaya nggak compute ulang tiap buka full player.
+const colorCache = new Map();
+
+async function extractDominantColors(track) {
+  if (!track || !track.cover) return null;
+  if (colorCache.has(track.id)) return colorCache.get(track.id);
+
+  const url = coverUrl(track);
+  if (!url) return null;
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        // Down-sample ke 50x50 supaya cepat
+        const size = 50;
+        const canvas = document.createElement('canvas');
+        canvas.width = size; canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, size, size);
+        const data = ctx.getImageData(0, 0, size, size).data;
+
+        // Bucket warna ke kotak 32×32×32 (5-bit per channel) supaya warna mirip di-merge
+        const buckets = new Map();
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+          if (a < 200) continue; // skip transparent
+          // Skip warna terlalu gelap atau terlalu terang
+          const max = Math.max(r, g, b), min = Math.min(r, g, b);
+          if (max < 30) continue; // hampir hitam
+          if (min > 235) continue; // hampir putih
+          // Skip warna terlalu ungu/grayscale (saturasi rendah)
+          const sat = max - min;
+          if (sat < 20 && max < 180) continue;
+          // Bucket key
+          const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+          buckets.set(key, (buckets.get(key) || 0) + 1 + sat); // weight by saturation
+        }
+
+        // Sort buckets by weight desc
+        const sorted = [...buckets.entries()].sort((a, b) => b[1] - a[1]);
+        if (sorted.length === 0) {
+          colorCache.set(track.id, null);
+          resolve(null);
+          return;
+        }
+
+        // Decode top 2 (atau fallback ke 1) — yang berbeda cukup banyak dari yang pertama
+        const decode = (key) => {
+          const r = ((key >> 10) & 0x1f) << 3;
+          const g = ((key >> 5) & 0x1f) << 3;
+          const b = (key & 0x1f) << 3;
+          return [r, g, b];
+        };
+        const dist = (a, b) => Math.abs(a[0]-b[0]) + Math.abs(a[1]-b[1]) + Math.abs(a[2]-b[2]);
+
+        const primary = decode(sorted[0][0]);
+        let secondary = primary;
+        for (let i = 1; i < Math.min(sorted.length, 20); i++) {
+          const c = decode(sorted[i][0]);
+          if (dist(c, primary) > 80) { secondary = c; break; }
+        }
+
+        // Darkenize sedikit supaya text putih tetap terbaca
+        const darken = (c, factor = 0.7) => c.map(x => Math.round(x * factor));
+        const result = {
+          primary: darken(primary, 0.85),
+          secondary: darken(secondary, 0.55),
+        };
+        colorCache.set(track.id, result);
+        resolve(result);
+      } catch (e) {
+        colorCache.set(track.id, null);
+        resolve(null);
+      }
+    };
+    img.onerror = () => {
+      colorCache.set(track.id, null);
+      resolve(null);
+    };
+    img.src = url;
+  });
+}
+
+function rgbStr(c) { return `rgb(${c[0]}, ${c[1]}, ${c[2]})`; }
+
 // Untuk artist/album: kita pakai cover lagu pertama (atau override)
 async function getArtistImage(artistName) {
   const ov = await dbGet(STORE_OVERRIDES, `artist:${artistName}`);
@@ -867,6 +1072,97 @@ async function quickFetchLyrics(track) {
   }
 }
 
+// =====================================================================
+// Auto-fetch Cover Art (MusicBrainz + Cover Art Archive)
+// =====================================================================
+// Search MusicBrainz untuk recording → ambil release ID → download cover dari CAA.
+// Free, no API key required. Rate limit 1 req/sec untuk MB API (kita kasih jeda 1.1s).
+async function fetchCoverArtFromMB(track) {
+  if (!track || !track.title) return { ok: false, error: 'Track tidak valid' };
+  try {
+    const enc = encodeURIComponent;
+    // 1. Search di MusicBrainz untuk recording
+    const query = `recording:"${track.title}" AND artist:"${track.artist || ''}"`;
+    const searchUrl = `https://musicbrainz.org/ws/2/recording/?query=${enc(query)}&fmt=json&limit=5`;
+    const sr = await fetch(searchUrl, { headers: { 'User-Agent': 'Sonara/1.0 (personal music app)' } });
+    if (!sr.ok) return { ok: false, error: `Search gagal (${sr.status})` };
+    const sj = await sr.json();
+    const recordings = sj.recordings || [];
+    if (recordings.length === 0) return { ok: false, error: 'Tidak ada hasil' };
+
+    // 2. Dari hasil, cari release pertama yang punya release ID
+    let releaseId = null;
+    for (const rec of recordings) {
+      const rels = rec.releases || [];
+      if (rels.length > 0 && rels[0].id) { releaseId = rels[0].id; break; }
+    }
+    if (!releaseId) return { ok: false, error: 'Tidak ada release info' };
+
+    // 3. Coba ambil cover dari CAA (Cover Art Archive)
+    const caaUrl = `https://coverartarchive.org/release/${releaseId}/front-500`;
+    const cr = await fetch(caaUrl);
+    if (!cr.ok) return { ok: false, error: 'Cover tidak tersedia' };
+    const blob = await cr.blob();
+    if (blob.size < 1000) return { ok: false, error: 'Cover terlalu kecil' };
+    return { ok: true, blob };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+async function quickFetchCover(track) {
+  showToast('Mencari cover art...', 2000);
+  try {
+    const result = await fetchCoverArtFromMB(track);
+    if (result.ok) {
+      // Save ke track
+      track.cover = result.blob;
+      await dbPut(STORE_TRACKS, track);
+      // Invalidate cache supaya UI update
+      coverUrlCache.delete(track.id);
+      colorCache.delete(track.id);
+      setState({ tracks: [...state.tracks] });
+      // Update currentTrack reference juga
+      if (state.currentTrack?.id === track.id) setState({ currentTrack: track });
+      showToast('✓ Cover ditemukan & disimpan!', 2500, 'success');
+    } else {
+      showToast('✗ ' + result.error, 3000, 'error');
+    }
+  } catch (e) {
+    showToast('✗ Error: ' + e.message, 3000, 'error');
+  }
+}
+
+// Bulk auto-fetch covers untuk lagu yang belum punya cover
+async function bulkFetchCovers() {
+  const noCover = state.tracks.filter(t => !t.cover);
+  if (noCover.length === 0) {
+    showToast('Semua lagu sudah punya cover art', 2000);
+    return;
+  }
+  if (!confirm(`Cari cover art untuk ${noCover.length} lagu? Bisa makan waktu beberapa menit (1.1 detik per lagu untuk hormati MusicBrainz rate limit).`)) return;
+
+  let found = 0, failed = 0;
+  for (let i = 0; i < noCover.length; i++) {
+    const track = noCover[i];
+    showToast(`Memproses ${i+1}/${noCover.length}: ${track.title}`, 1500);
+    const result = await fetchCoverArtFromMB(track);
+    if (result.ok) {
+      track.cover = result.blob;
+      await dbPut(STORE_TRACKS, track);
+      coverUrlCache.delete(track.id);
+      colorCache.delete(track.id);
+      found++;
+    } else {
+      failed++;
+    }
+    setState({ tracks: [...state.tracks] });
+    // Rate limit: 1.1s per request
+    if (i < noCover.length - 1) await new Promise(r => setTimeout(r, 1100));
+  }
+  showToast(`Selesai: ${found} cover ditemukan, ${failed} gagal`, 4000, found > 0 ? 'success' : 'error');
+}
+
 async function deleteTrack(id) {
   await dbDelete(STORE_TRACKS, id);
   setState((s) => ({ tracks: s.tracks.filter(t => t.id !== id) }));
@@ -981,6 +1277,8 @@ async function init() {
     playlists: playlists || [],
     recentlyPlayed: (recent && recent.value) || [],
   });
+  // Load EQ settings (lazy init kalau ada saved gains non-zero)
+  loadSavedEQ();
 }
 
 // =====================================================================
@@ -1015,6 +1313,7 @@ function renderApp() {
   else _wasFullPlayerOpen = false; // Reset flag supaya open berikutnya animasi lagi
   if (state.queueSheetOpen) wrap.appendChild(renderQueueSheet());
   if (state.sleepTimerSheetOpen) wrap.appendChild(renderSleepTimerSheet());
+  if (state.eqSheetOpen) wrap.appendChild(renderEQSheet());
   if (state.contextMenuTrack) wrap.appendChild(renderContextMenu());
   if (state.importDialogOpen) wrap.appendChild(renderImportDialog());
 
@@ -1442,6 +1741,21 @@ function renderLibraryView() {
     chipsWrap.appendChild(chip);
   });
   wrap.appendChild(chipsWrap);
+
+  // Tip: tombol "Cari cover otomatis" muncul kalau ada lagu tanpa cover
+  const noCoverCount = state.tracks.filter(t => !t.cover).length;
+  if (noCoverCount > 0) {
+    const tipRow = el('div', 'flex items-center gap-3 bg-white/5 rounded-lg px-3 py-2 mb-4');
+    const ic = el('div', 'text-spo-green flex-shrink-0');
+    ic.innerHTML = svgIcon('music', 20);
+    tipRow.appendChild(ic);
+    tipRow.appendChild(el('div', 'flex-1 text-sm', `${noCoverCount} lagu belum punya cover art`));
+    const btn = el('button', 'px-3 py-1 bg-spo-green text-black font-semibold rounded-full text-xs');
+    btn.textContent = 'Cari semua';
+    btn.onclick = bulkFetchCovers;
+    tipRow.appendChild(btn);
+    wrap.appendChild(tipRow);
+  }
 
   // Create playlist button
   const createPl = el('button', 'flex items-center gap-3 mb-2 hover:bg-white/5 rounded-md p-2 -mx-2 transition w-full text-left');
@@ -2076,9 +2390,23 @@ function renderFullPlayer() {
     blurImg.style.backgroundSize = 'cover';
     blurImg.style.backgroundPosition = 'center';
     bg.appendChild(blurImg);
-    // Dark gradient overlay
+
+    // === Color theme adaptif ===
+    // Layer warna dominan (di atas blur, di bawah dark gradient) supaya visual
+    // berasa "diwarnai" sesuai mood cover. Diawali transparan, fade-in saat warna selesai di-extract.
+    const colorLayer = el('div', 'absolute inset-0 transition-opacity duration-700');
+    colorLayer.style.opacity = '0';
+    bg.appendChild(colorLayer);
+    extractDominantColors(t).then(colors => {
+      if (!colors) return;
+      // Gradient dari primary di atas → secondary di bawah
+      colorLayer.style.background = `linear-gradient(180deg, ${rgbStr(colors.primary)} 0%, ${rgbStr(colors.secondary)} 60%, #000 100%)`;
+      colorLayer.style.opacity = '0.65';
+    });
+
+    // Dark gradient overlay di paling atas — bikin teks tetap terbaca
     const grad = el('div', 'absolute inset-0');
-    grad.style.background = 'linear-gradient(180deg, rgba(0,0,0,0.3) 0%, rgba(0,0,0,0.5) 50%, rgba(0,0,0,0.85) 100%)';
+    grad.style.background = 'linear-gradient(180deg, rgba(0,0,0,0.25) 0%, rgba(0,0,0,0.35) 40%, rgba(0,0,0,0.65) 80%, rgba(0,0,0,0.85) 100%)';
     bg.appendChild(grad);
   }
   overlay.appendChild(bg);
@@ -2109,12 +2437,18 @@ function renderFullPlayer() {
   content.appendChild(middle);
 
   // Lyrics panel (hidden by default)
-  const lyricsPanel = el('div', 'absolute inset-0 px-6 pb-4 overflow-y-auto scroll-y opacity-0 pointer-events-none transition-opacity duration-500');
-  lyricsPanel.style.maxHeight = '100%';
+  // PENTING: pakai overflow-hidden bukan scroll-y, scroll dilakukan via transform translateY
+  // ke inner container (jauh lebih smooth daripada scrollIntoView yang punya overshoot/jitter)
+  const lyricsPanel = el('div', 'absolute inset-0 overflow-hidden opacity-0 pointer-events-none transition-opacity duration-500');
   middle.appendChild(lyricsPanel);
+  // Inner scroller — yang akan kita translateY untuk efek auto-scroll super halus
+  const lyricsInner = el('div', 'absolute left-0 right-0 px-6 will-change-transform');
+  lyricsInner.style.top = '50%';
+  lyricsInner.style.transform = 'translateY(0)';
+  lyricsInner.style.transition = 'transform 800ms cubic-bezier(0.22, 1, 0.36, 1)';
+  lyricsPanel.appendChild(lyricsInner);
 
   // Toggle attached ke top bar (kanan, di samping tombol more)
-  // Pasang di top bar, sebelah kiri tombol more
   if (t.lyrics || t.lyricsSynced) {
     const lyricBtn = el('button', 'mr-1 px-3 py-1 rounded-full bg-white/15 text-xs font-semibold');
     lyricBtn.textContent = 'LIRIK';
@@ -2123,32 +2457,35 @@ function renderFullPlayer() {
       lyricsShown = !lyricsShown;
       if (lyricsShown) {
         // Build lirik content
-        lyricsPanel.innerHTML = '';
+        lyricsInner.innerHTML = '';
         if (t.lyricsSynced && t.lyricsSynced.length > 0) {
           // Synced: tiap baris jadi div dengan timestamp
-          // Animasi smooth: opacity + scale + color, durasi panjang (600ms) untuk feel halus
           t.lyricsSynced.forEach((ln, idx) => {
-            const lineEl = el('div', 'lyr-line py-2 px-1 text-lg font-semibold leading-snug cursor-pointer');
+            const lineEl = el('div', 'lyr-line py-3 text-xl font-bold leading-snug cursor-pointer');
             lineEl.dataset.lyrIdx = String(idx);
             lineEl.dataset.lyrTime = String(ln.time);
             lineEl.textContent = ln.text;
-            // Inline style supaya transisi konsisten lintas browser
-            lineEl.style.transition = 'opacity 600ms ease-out, transform 600ms ease-out, color 600ms ease-out';
+            // Transisi smooth super-panjang (900ms) untuk pergantian highlight
+            // Pakai cubic-bezier yang sama dengan translateY supaya kerasa synced
+            lineEl.style.transition = 'opacity 900ms cubic-bezier(0.22, 1, 0.36, 1), transform 900ms cubic-bezier(0.22, 1, 0.36, 1), color 900ms cubic-bezier(0.22, 1, 0.36, 1), filter 900ms cubic-bezier(0.22, 1, 0.36, 1)';
             lineEl.style.color = 'rgba(255,255,255,0.35)';
-            lineEl.style.opacity = '0.6';
-            lineEl.style.transform = 'scale(0.96)';
+            lineEl.style.opacity = '0.55';
+            lineEl.style.transform = 'translateZ(0) scale(0.94)';
             lineEl.style.transformOrigin = 'left center';
+            lineEl.style.filter = 'blur(0.5px)';
             lineEl.onclick = () => { audio.currentTime = ln.time; };
-            lyricsPanel.appendChild(lineEl);
+            lyricsInner.appendChild(lineEl);
           });
-          // Padding atas/bawah biar baris aktif bisa di-scroll ke tengah
-          lyricsPanel.style.paddingTop = '40%';
-          lyricsPanel.style.paddingBottom = '40%';
         } else {
-          // Plain text
-          const pre = el('pre', 'whitespace-pre-wrap text-white/85 text-base leading-relaxed font-sans');
+          // Plain text — pakai overflow scroll biasa karena nggak ada timing
+          lyricsInner.style.position = 'static';
+          lyricsInner.style.transform = '';
+          lyricsInner.style.transition = '';
+          lyricsPanel.classList.remove('overflow-hidden');
+          lyricsPanel.classList.add('overflow-y-auto', 'scroll-y');
+          const pre = el('pre', 'whitespace-pre-wrap text-white/85 text-base leading-relaxed font-sans pt-4 pb-8');
           pre.textContent = t.lyrics;
-          lyricsPanel.appendChild(pre);
+          lyricsInner.appendChild(pre);
         }
         lyricsPanel.classList.remove('opacity-0', 'pointer-events-none');
         lyricBtn.classList.add('bg-spo-green', 'text-black');
@@ -2162,12 +2499,12 @@ function renderFullPlayer() {
     // Insert before more button
     top.insertBefore(lyricBtn, more);
 
-    // Auto-scroll synced lyrics — listen ke time updates
+    // Auto-scroll synced lyrics — translate inner container, bukan scrollIntoView
     if (t.lyricsSynced && t.lyricsSynced.length > 0) {
       let lastActiveIdx = -1;
       const unsubLyrics = onTimeUpdate((cur) => {
         if (!lyricsShown) return;
-        // Find baris aktif: baris dengan time <= cur, dan baris berikutnya time > cur
+        // Find baris aktif
         let activeIdx = -1;
         for (let i = 0; i < t.lyricsSynced.length; i++) {
           if (t.lyricsSynced[i].time <= cur) activeIdx = i;
@@ -2175,38 +2512,45 @@ function renderFullPlayer() {
         }
         if (activeIdx === lastActiveIdx) return;
         lastActiveIdx = activeIdx;
-        const lines = lyricsPanel.querySelectorAll('[data-lyr-idx]');
+        const lines = lyricsInner.querySelectorAll('[data-lyr-idx]');
+        if (lines.length === 0) return;
+
+        // === STEP 1: Update style tiap baris (gradient opacity by distance) ===
         lines.forEach((ln, i) => {
-          // Distance dari baris aktif (untuk gradient opacity yang halus)
           const dist = Math.abs(i - activeIdx);
           if (i === activeIdx) {
-            // Aktif — paling terang, sedikit besar
+            // Aktif — penuh, scale up, no blur
             ln.style.color = 'rgba(255,255,255,1)';
             ln.style.opacity = '1';
-            ln.style.transform = 'scale(1.05)';
-            ln.style.fontWeight = '700';
-            // Scroll ke tengah, smooth
-            ln.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            ln.style.transform = 'translateZ(0) scale(1.06)';
+            ln.style.filter = 'blur(0)';
           } else if (dist === 1) {
-            // Tetangga langsung — agak redup
-            ln.style.color = 'rgba(255,255,255,0.55)';
-            ln.style.opacity = '0.85';
-            ln.style.transform = 'scale(0.98)';
-            ln.style.fontWeight = '600';
+            ln.style.color = 'rgba(255,255,255,0.6)';
+            ln.style.opacity = '0.9';
+            ln.style.transform = 'translateZ(0) scale(0.99)';
+            ln.style.filter = 'blur(0)';
           } else if (dist <= 3) {
-            // Beberapa baris dari aktif — mulai pudar
-            ln.style.color = 'rgba(255,255,255,0.35)';
-            ln.style.opacity = '0.65';
-            ln.style.transform = 'scale(0.96)';
-            ln.style.fontWeight = '600';
+            ln.style.color = 'rgba(255,255,255,0.4)';
+            ln.style.opacity = '0.7';
+            ln.style.transform = 'translateZ(0) scale(0.96)';
+            ln.style.filter = 'blur(0.4px)';
           } else {
-            // Jauh — paling pudar
             ln.style.color = 'rgba(255,255,255,0.25)';
             ln.style.opacity = '0.45';
-            ln.style.transform = 'scale(0.94)';
-            ln.style.fontWeight = '600';
+            ln.style.transform = 'translateZ(0) scale(0.94)';
+            ln.style.filter = 'blur(0.8px)';
           }
         });
+
+        // === STEP 2: Translate inner container supaya baris aktif tepat di tengah ===
+        // Hitung offset baris aktif dari atas inner container
+        const activeLine = lines[activeIdx];
+        if (!activeLine) return;
+        // offsetTop dari activeLine relatif ke inner container
+        const lineCenter = activeLine.offsetTop + (activeLine.offsetHeight / 2);
+        // Kita mau lineCenter berada di y = 0 dari inner top: 50% panel.
+        // Karena lyricsInner.style.top = '50%', translateY(-lineCenter) bikin baris di tengah.
+        lyricsInner.style.transform = `translateY(${-lineCenter}px)`;
       });
       // Cleanup saat overlay di-unmount
       const obs = new MutationObserver(() => {
@@ -2556,7 +2900,103 @@ function renderSleepTimerSheet() {
   return overlay;
 }
 
-// ----- Context Menu (track ⋯) -----
+// ----- Equalizer Sheet -----
+function renderEQSheet() {
+  const overlay = el('div', 'fixed inset-0 z-[60] flex flex-col sheet-backdrop eq-sheet-overlay');
+  const sheet = el('div', 'bg-spo-sheet rounded-t-2xl animate-slide-up safe-bottom max-h-[85vh] flex flex-col');
+  const doClose = () => closeSheetWithAnim(overlay, sheet, () => setState({ eqSheetOpen: false }));
+  overlay.onclick = (e) => { if (e.target === overlay) doClose(); };
+  overlay.appendChild(el('div', 'flex-1'));
+
+  // Handle
+  sheet.appendChild(el('div', 'flex justify-center pt-2 pb-2',));
+  sheet.lastChild.innerHTML = '<div class="w-10 h-1 bg-white/40 rounded-full"></div>';
+
+  // Title row dengan tombol close
+  const titleRow = el('div', 'relative py-3 border-b border-white/10');
+  titleRow.appendChild(el('div', 'text-center font-bold', 'Equalizer'));
+  const closeEq = el('button', 'absolute top-1/2 right-3 -translate-y-1/2 w-9 h-9 flex items-center justify-center rounded-full hover:bg-white/10 active:bg-white/20');
+  closeEq.innerHTML = svgIcon('close', 20);
+  closeEq.onclick = (e) => { e.stopPropagation(); doClose(); };
+  titleRow.appendChild(closeEq);
+  sheet.appendChild(titleRow);
+
+  // Preset selector — horizontal scrollable
+  const presetRow = el('div', 'flex gap-2 overflow-x-auto scroll-y px-4 py-3 border-b border-white/10');
+  Object.keys(EQ_PRESETS).forEach(name => {
+    const btn = el('button', `flex-shrink-0 px-4 py-1.5 rounded-full text-sm font-semibold transition ${name === _eqPreset ? 'bg-spo-green text-black' : 'bg-white/10 text-white hover:bg-white/20'}`);
+    btn.textContent = name;
+    btn.onclick = () => {
+      _eqPreset = name;
+      const gains = EQ_PRESETS[name];
+      applyEQ(gains);
+      // Re-render sheet biar slider update
+      setState({});
+    };
+    presetRow.appendChild(btn);
+  });
+  sheet.appendChild(presetRow);
+
+  // Slider grid: 5 sliders vertikal
+  const grid = el('div', 'flex justify-around items-end px-4 py-6 gap-2 flex-1 min-h-[260px]');
+  EQ_BANDS.forEach((band, i) => {
+    const col = el('div', 'flex flex-col items-center gap-2 flex-1');
+    // dB readout di atas slider
+    const readout = el('div', 'text-xs font-mono text-spo-textMuted tabular-nums');
+    const showDb = (v) => readout.textContent = (v > 0 ? '+' : '') + v.toFixed(0) + ' dB';
+    showDb(_eqGains[i] || 0);
+    col.appendChild(readout);
+
+    // Slider vertikal
+    const sliderWrap = el('div', 'flex-1 flex items-center justify-center min-h-[160px]');
+    const slider = el('input', 'eq-slider');
+    slider.type = 'range';
+    slider.min = '-12';
+    slider.max = '12';
+    slider.step = '0.5';
+    slider.value = String(_eqGains[i] || 0);
+    // Pakai vertical orientation via CSS rotate (cross-browser)
+    slider.style.writingMode = 'bt-lr';
+    slider.style.appearance = 'slider-vertical';
+    slider.style.height = '160px';
+    slider.style.width = '40px';
+    slider.style.background = 'transparent';
+    slider.oninput = (e) => {
+      const v = parseFloat(e.target.value);
+      _eqGains[i] = v;
+      showDb(v);
+      // Cek kalau gain nggak match preset, set jadi "Custom"
+      const matches = Object.entries(EQ_PRESETS).find(([_, gs]) => gs.every((g, j) => Math.abs(g - _eqGains[j]) < 0.5));
+      _eqPreset = matches ? matches[0] : 'Custom';
+      applyEQ(_eqGains.slice());
+    };
+    sliderWrap.appendChild(slider);
+    col.appendChild(sliderWrap);
+
+    // Label freq di bawah
+    const lbl = el('div', 'text-xs text-spo-textMuted font-semibold');
+    lbl.textContent = band.freq >= 1000 ? (band.freq/1000) + 'k' : String(band.freq);
+    col.appendChild(lbl);
+
+    grid.appendChild(col);
+  });
+  sheet.appendChild(grid);
+
+  // Reset button
+  const resetRow = el('div', 'px-5 py-3 border-t border-white/10 flex justify-center');
+  const resetBtn = el('button', 'px-6 py-2 bg-white/10 hover:bg-white/20 rounded-full text-sm font-semibold');
+  resetBtn.textContent = 'Reset ke Normal';
+  resetBtn.onclick = () => {
+    _eqPreset = 'Normal';
+    applyEQ([0, 0, 0, 0, 0]);
+    setState({});
+  };
+  resetRow.appendChild(resetBtn);
+  sheet.appendChild(resetRow);
+
+  overlay.appendChild(sheet);
+  return overlay;
+}
 function renderContextMenu() {
   const t = state.contextMenuTrack;
   const overlay = el('div', 'fixed inset-0 z-[55] flex flex-col sheet-backdrop');
@@ -2595,9 +3035,16 @@ function renderContextMenu() {
     { icon: 'queue', label: 'Tambahkan ke Antrean', onClick: () => { addToQueue(t.id); doClose(); } },
     { icon: 'pencil', label: t.lyrics ? 'Edit lirik' : 'Tambah lirik', onClick: () => doClose(() => openLyricsEditor(t)) },
     { icon: 'search', label: 'Cari lirik otomatis', onClick: () => doClose(() => quickFetchLyrics(t)) },
+  ];
+  // Item Cari cover hanya muncul kalau lagu belum punya cover
+  if (!t.cover) {
+    items.push({ icon: 'music', label: 'Cari cover otomatis', onClick: () => doClose(() => quickFetchCover(t)) });
+  }
+  items.push(
+    { icon: 'equalizer', label: 'Equalizer', onClick: () => doClose(() => setState({ eqSheetOpen: true })) },
     { icon: 'album', label: 'Buka album', onClick: () => doClose(() => setState({ view: 'album', viewParam: t.album, fullPlayerOpen: false })) },
     { icon: 'artist', label: 'Buka artis', onClick: () => doClose(() => setState({ view: 'artist', viewParam: t.artist, fullPlayerOpen: false })) },
-  ];
+  );
   // Hapus dari playlist (kalau context = playlist)
   if (t._ctx?.type === 'playlist' && t._ctx?.id) {
     items.push({ icon: 'minus-circle', label: 'Hapus dari playlist ini', onClick: () => { removeFromPlaylist(t._ctx.id, t.id); doClose(); } });
@@ -2838,6 +3285,7 @@ function svgIcon(name, size = 24) {
     artist: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-7 8-7s8 3 8 7"/></svg>`,
     trash: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v5M14 11v5"/></svg>`,
     close: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`,
+    equalizer: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 4v6M6 14v6M12 4v3M12 11v9M18 4v9M18 13v7"/><circle cx="6" cy="12" r="2"/><circle cx="12" cy="9" r="2"/><circle cx="18" cy="11" r="2"/></svg>`,
   };
   return icons[name] || `<svg width="${s}" height="${s}" viewBox="0 0 24 24"></svg>`;
 }
@@ -2873,6 +3321,7 @@ function getOverlayDepth() {
   if (state.fullPlayerOpen) d++;
   if (state.queueSheetOpen) d++;
   if (state.sleepTimerSheetOpen) d++;
+  if (state.eqSheetOpen) d++;
   if (state.contextMenuTrack) d++;
   return d;
 }
@@ -2980,6 +3429,8 @@ window.addEventListener('popstate', (e) => {
   // Tutup yang paling depan (urutan prioritas)
   if (state.contextMenuTrack) {
     animateAndClose('.fixed.inset-0.z-\\[55\\]', '.bg-spo-sheet', { contextMenuTrack: null });
+  } else if (state.eqSheetOpen) {
+    animateAndClose('.fixed.inset-0.eq-sheet-overlay', '.bg-spo-sheet', { eqSheetOpen: false });
   } else if (state.sleepTimerSheetOpen) {
     animateAndClose('.fixed.inset-0.z-\\[60\\]', '.bg-spo-sheet', { sleepTimerSheetOpen: false });
   } else if (state.queueSheetOpen) {
