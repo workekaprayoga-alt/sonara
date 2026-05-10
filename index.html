@@ -294,8 +294,10 @@ async function dbPut(store, val) {
   const db = await openDB();
   return new Promise((res, rej) => {
     const tx = db.transaction(store, 'readwrite');
-    tx.objectStore(store).put(val);
-    tx.oncomplete = () => res();
+    const req = tx.objectStore(store).put(val);
+    let key = null;
+    req.onsuccess = () => { key = req.result; };
+    tx.oncomplete = () => res(key);
     tx.onerror = () => rej(tx.error);
   });
 }
@@ -621,16 +623,33 @@ async function loadAndPlay(track) {
 // - Saat audio playing, increment durationListened tiap detik
 // - Saat lagu ganti, di-pause, atau di-flush, save session ke STORE_HISTORY
 //   (asal durationListened >= 5 detik, supaya nggak nge-spam history dengan skip cepet)
-let _currentSession = null; // { trackId, startedAt, lastTickAt, durationListened }
+// _currentSession: { id?, trackId, startedAt, lastTickAt, durationListened, lastSavedDuration }
+// - id: nomor record di STORE_HISTORY (di-set setelah first save), supaya update pakai id sama
+// - lastSavedDuration: durasi yang udah ke-save terakhir, untuk decide kapan re-save
+let _currentSession = null;
 let _sessionTickInterval = null;
+let _historyChangedCallbacks = [];
+
+function onHistoryChanged(cb) {
+  _historyChangedCallbacks.push(cb);
+  return () => {
+    _historyChangedCallbacks = _historyChangedCallbacks.filter(x => x !== cb);
+  };
+}
+function notifyHistoryChanged() {
+  invalidateHistoryCache();
+  _historyChangedCallbacks.forEach(cb => { try { cb(); } catch(e){} });
+}
 
 function startListeningSession(trackId) {
   // Bikin session baru
   _currentSession = {
+    id: null,
     trackId,
     startedAt: Date.now(),
     lastTickAt: Date.now(),
     durationListened: 0,
+    lastSavedDuration: 0,
   };
   if (_sessionTickInterval) clearInterval(_sessionTickInterval);
   _sessionTickInterval = setInterval(tickListeningSession, 1000);
@@ -640,12 +659,36 @@ function tickListeningSession() {
   if (!_currentSession) return;
   // Cuma increment kalau audio benar-benar playing (bukan paused/buffering)
   if (audio.paused) return;
-  if (document.hidden && audio.paused) return;
   const now = Date.now();
   const delta = (now - _currentSession.lastTickAt) / 1000;
   // Cap delta supaya skip atau sleep/wake nggak nambah jam dengar palsu
   if (delta <= 2) _currentSession.durationListened += delta;
   _currentSession.lastTickAt = now;
+
+  // Periodic save: tiap pertambahan 10 detik, simpan/update ke history
+  // Jadi user lihat stats berubah real-time, gak harus tunggu lagu ganti
+  const gained = _currentSession.durationListened - _currentSession.lastSavedDuration;
+  if (_currentSession.durationListened >= 5 && gained >= 10) {
+    persistSessionSnapshot();
+  }
+}
+
+async function persistSessionSnapshot() {
+  if (!_currentSession) return;
+  const s = _currentSession;
+  if (s.durationListened < 5) return;
+  try {
+    const record = {
+      trackId: s.trackId,
+      playedAt: s.startedAt,
+      durationListened: Math.round(s.durationListened),
+    };
+    if (s.id) record.id = s.id;
+    const savedId = await dbPut(STORE_HISTORY, record);
+    if (!s.id && savedId) s.id = savedId;
+    s.lastSavedDuration = s.durationListened;
+    notifyHistoryChanged();
+  } catch (e) { console.warn('Failed to save session snapshot', e); }
 }
 
 async function flushListeningSession() {
@@ -659,12 +702,14 @@ async function flushListeningSession() {
   // Cuma save kalau durasi >= 5 detik (filter skip cepet)
   if (s.durationListened < 5) return;
   try {
-    await dbPut(STORE_HISTORY, {
+    const record = {
       trackId: s.trackId,
       playedAt: s.startedAt,
       durationListened: Math.round(s.durationListened),
-    });
-    invalidateHistoryCache();
+    };
+    if (s.id) record.id = s.id;
+    await dbPut(STORE_HISTORY, record);
+    notifyHistoryChanged();
   } catch (e) { console.warn('Failed to save session', e); }
 }
 
@@ -1904,6 +1949,21 @@ function getGreeting() {
 let _statsPeriod = 'week';
 
 async function renderStatsSection(container) {
+  // Subscribe ke history changes — auto-refresh saat session baru di-save.
+  // Cuma subscribe sekali per container (pakai flag).
+  if (!container._statsSubscribed) {
+    container._statsSubscribed = true;
+    const unsubscribe = onHistoryChanged(() => {
+      // Cek kalau container masih di DOM (Home masih aktif)
+      if (document.body.contains(container)) {
+        renderStatsSection(container);
+      } else {
+        unsubscribe();
+        container._statsSubscribed = false;
+      }
+    });
+  }
+
   // Placeholder saat loading
   container.innerHTML = `
     <div class="bg-gradient-to-br from-purple-900/40 via-pink-900/30 to-orange-900/30 rounded-2xl p-5 mb-4">
@@ -1926,7 +1986,7 @@ async function renderStatsSection(container) {
         <div class="text-2xl">📊</div>
         <h2 class="text-xl font-bold">Statistik kamu</h2>
       </div>
-      <div class="text-sm text-spo-textMuted">Dengar lagu untuk mulai tracking statistik dengarmu. Data muncul setelah 5 detik dengar pertama.</div>
+      <div class="text-sm text-spo-textMuted">Dengar lagu minimal 5 detik untuk mulai tracking. Statistik update otomatis tiap 10 detik tanpa harus ganti lagu.</div>
     `;
     container.appendChild(card);
     return;

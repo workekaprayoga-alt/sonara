@@ -1,89 +1,40 @@
-# Sonara v7 — Stats Dashboard ("Sonara Wrapped")
+# Sonara v7.1 — Patch tracking statistik
 
-Versi ini fokus 100% di **tracking + analytics dengarmu** — fitur premium-style Spotify.
+Fix kecil untuk v7: stats nggak muncul walaupun udah dengar berapa lagu.
 
-## ✨ Fitur baru
+## 🐛 Akar masalah
 
-### 📊 Stats Dashboard di Home page
-Section baru di paling atas Home: **kartu statistik penuh** dengan gradient ungu-pink-orange (vibes Spotify Wrapped).
+Di v7, session listening **cuma di-save ke history saat lagu ganti**. Jadi kalau user dengar 1-2 lagu yang panjang tanpa pernah ganti (atau yang kedua belum selesai), history-nya tetep kosong → stats tampil "Dengar lagu untuk mulai tracking...".
 
-### Filter periode
-5 tab waktu, tap untuk switch:
-- **Hari ini** — sejak jam 00:00 hari ini
-- **7 Hari** — 7 hari ke belakang
-- **30 Hari** — 30 hari ke belakang
-- **Tahun** — 365 hari ke belakang
-- **Semua** — sepanjang waktu
+Plus, halaman Home cuma render sekali — kalau history baru ke-save sementara user lagi di Home, dia gak auto-refresh.
 
-### 4 metric utama (grid 2×2)
-- **⏱️ Jam dengar** — total durasi yang benar-benar didengar (bukan cuma play count)
-- **🎵 Lagu unik** — berapa lagu berbeda yang didengar dalam periode
-- **🔥 Streak** — berapa hari berturut-turut dengar musik (mundur dari hari ini)
-- **▶️ Sesi** — total sesi dengar dalam periode
+## ✅ Fix di v7.1
 
-### Top Lagu
-Top 5 lagu paling sering diputar di periode, dengan:
-- Ranking (1, 2, 3 dapet warna emas/perak/perunggu)
-- Cover art kecil
-- Judul + artis
-- Jumlah play count + total durasi yang didengar
-- Tap = langsung putar
+### 1. Periodic save tiap 10 detik
+Setiap session yang udah dengar >= 5 detik, otomatis ke-save ke IndexedDB **tiap pertambahan 10 detik**, gak nunggu lagu ganti. Update pakai ID record yang sama (gak nge-spam history).
 
-### Top Artis
-Top 5 artis paling sering diputar di periode, dengan play count.
+Hasilnya: dengar 1 lagu selama 15 detik aja, stats udah mulai jalan. Tap tab lain lalu balik Home, atau biarkan aja — auto-refresh sekarang jalan.
 
-### 📈 Bar chart aktivitas harian
-Visual bar chart 7 atau 30 hari terakhir — kelihatan langsung kapan kamu paling sering dengar musik. Bar warna hijau Sonara, tinggi proportional ke durasi.
+### 2. Auto-refresh stats section
+Stats section sekarang subscribe ke history change. Setiap kali ada save baru (tiap 10 detik), Home page section stats refresh sendiri tanpa user perlu navigate ke tab lain dulu.
 
-### 💡 Wawasan (insights)
-3 insight cards otomatis (muncul kalau ada cukup data):
-- **🏆 Hari paling intens** — hari dengan jam dengar tertinggi (dengan tanggal lengkap)
-- **🕐 Jam favorit dengar** — pukul berapa kamu paling sering dengar musik (pagi/siang/sore/malam)
-- **📅 Hari paling musik** — hari apa dalam seminggu yang kamu paling sering dengar
+### 3. Onboarding text lebih akurat
+Pesan sebelum ada data sekarang: *"Dengar lagu minimal 5 detik untuk mulai tracking. Statistik update otomatis tiap 10 detik tanpa harus ganti lagu."*
 
-## ⚙️ Tracking mechanism
+## 📁 File yang berubah
 
-Tiap kali lagu diputar:
-1. **Session dimulai** saat audio play, tracked dengan timestamp + trackId
-2. **Tiap 1 detik** durasi yang benar-benar didengar di-increment (cuma kalau audio playing, bukan paused atau buffering)
-3. **Cap delta 2 detik** supaya HP sleep / wake / network lag tidak nge-fake jam dengar
-4. **Saat lagu ganti / pause >10 detik / page closed**, session di-flush ke IndexedDB
+Cuma 3 file — gak perlu replace seluruh paket:
 
-Filter anti-spam: **session <5 detik nggak disimpan** (filter user skip cepet).
+1. `index.html` — patch session tracking + auto-refresh
+2. `sw.js` — bump cache ke `sonara-v12`
+3. `CHANGELOG.md` — (file ini)
 
-Data disimpan di IndexedDB store baru `history` dengan index `byTime` (untuk filter periode efisien) dan `byTrack` (untuk top tracks).
+## Test setelah deploy
 
-## 🔧 Update teknis
+1. Tutup Sonara, buka lagi → SW update ke v12
+2. Buka Home → masih "Dengar lagu minimal 5 detik..." (kalau pertama kali)
+3. Putar lagu apa aja
+4. **Diam aja di Home page** — stats akan muncul otomatis dalam 10-15 detik (gak perlu ganti tab)
+5. Biarin lagu jalan terus → angka "Jam dengar" naik tiap 10 detik
 
-- DB version dinaikkan 2 → 3 (auto-migrate, gak ada data loss)
-- Service Worker dinaikkan ke `sonara-v11`
-- History cache 30 detik di-memory supaya dashboard render cepat
-- Stats section render async (tidak blocking)
-
-## Roadmap tersisa untuk 100% Spotify-feel
-
-Sekarang Sonara udah di ~82%. Sisanya:
-- **v8** (~89%): Crossfade, Gapless, Volume normalization, Vinyl mode
-- **v9** (~95%): Tag editor, Backup/Restore, Drag-reorder, Bulk operations
-- **v10** (~99%): Podcast support, Listening history detail, micro-interactions
-
-## Cara update di HP
-
-1. Update file di GitHub
-2. Tunggu Vercel redeploy
-3. Tutup Sonara, buka lagi → SW auto-update ke v11
-
-Kalau masih versi lama: tekan lama icon → App info → Storage → Clear cache (jangan Clear data!).
-
-## Test checklist
-
-- ✅ Buka Home → stats section di paling atas
-- ✅ Pertama kali (sebelum dengar apa-apa) → tampil pesan "Dengar lagu untuk mulai tracking..."
-- ✅ Dengar 1 lagu >5 detik → balik Home → metric "Jam dengar" muncul angka
-- ✅ Switch tab "Hari ini" / "7 Hari" / "30 Hari" → data filter sesuai
-- ✅ Top Lagu menampilkan ranking + play count + durasi
-- ✅ Bar chart muncul untuk periode 7/30 hari
-- ✅ Insight cards muncul setelah ada data cukup
-- ✅ Streak terhitung berdasarkan hari berturut-turut dengar musik
-
-Selamat dengar lagi dan lihat statistikmu tumbuh! 🎵📊
+Kalau masih gak muncul setelah 30 detik dengar, kemungkinan dbPut return tipe yang gak match — kasih kabar ke saya, saya cek log console.
