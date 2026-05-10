@@ -233,11 +233,12 @@
 
 // ---------- IndexedDB Storage ----------
 const DB_NAME = 'sonara-db';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE_TRACKS = 'tracks';
 const STORE_PLAYLISTS = 'playlists';
 const STORE_META = 'meta';
 const STORE_OVERRIDES = 'overrides'; // foto artist/album custom
+const STORE_HISTORY = 'history'; // listening history per session — untuk Stats Dashboard
 
 let dbInstance = null;
 
@@ -260,6 +261,12 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains(STORE_OVERRIDES)) {
         db.createObjectStore(STORE_OVERRIDES, { keyPath: 'key' });
+      }
+      if (!db.objectStoreNames.contains(STORE_HISTORY)) {
+        // History entry: { id (auto), trackId, playedAt (ms timestamp), durationListened (sec) }
+        const hs = db.createObjectStore(STORE_HISTORY, { keyPath: 'id', autoIncrement: true });
+        hs.createIndex('byTime', 'playedAt');
+        hs.createIndex('byTrack', 'trackId');
       }
     };
   });
@@ -573,6 +580,9 @@ window.addEventListener('blur', () => { /* biarkan audio jalan */ });
 
 async function loadAndPlay(track) {
   if (!track) return;
+  // FLUSH session sebelumnya kalau ada — lagu sebelumnya udah selesai didengar
+  flushListeningSession();
+
   if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
   currentObjectUrl = URL.createObjectURL(track.blob);
   audio.src = currentObjectUrl;
@@ -587,6 +597,9 @@ async function loadAndPlay(track) {
   setState({ recentlyPlayed: rp });
   await dbPut(STORE_META, { key: 'recentlyPlayed', value: rp });
 
+  // Start session tracker untuk lagu baru ini
+  startListeningSession(track.id);
+
   // Increment play count + update lastPlayedAt (untuk Top Tracks & Smart Playlist)
   // Pakai timer 5 detik supaya nggak hitung kalau user skip cepet.
   if (loadAndPlay._countTimer) clearTimeout(loadAndPlay._countTimer);
@@ -599,6 +612,95 @@ async function loadAndPlay(track) {
     setState({ tracks: [...state.tracks] });
   }, 5000);
 }
+
+// =====================================================================
+// Listening Session Tracker (untuk Stats Dashboard / Sonara Wrapped)
+// =====================================================================
+// Logika:
+// - Tiap lagu yang diputar bikin 1 "session"
+// - Saat audio playing, increment durationListened tiap detik
+// - Saat lagu ganti, di-pause, atau di-flush, save session ke STORE_HISTORY
+//   (asal durationListened >= 5 detik, supaya nggak nge-spam history dengan skip cepet)
+let _currentSession = null; // { trackId, startedAt, lastTickAt, durationListened }
+let _sessionTickInterval = null;
+
+function startListeningSession(trackId) {
+  // Bikin session baru
+  _currentSession = {
+    trackId,
+    startedAt: Date.now(),
+    lastTickAt: Date.now(),
+    durationListened: 0,
+  };
+  if (_sessionTickInterval) clearInterval(_sessionTickInterval);
+  _sessionTickInterval = setInterval(tickListeningSession, 1000);
+}
+
+function tickListeningSession() {
+  if (!_currentSession) return;
+  // Cuma increment kalau audio benar-benar playing (bukan paused/buffering)
+  if (audio.paused) return;
+  if (document.hidden && audio.paused) return;
+  const now = Date.now();
+  const delta = (now - _currentSession.lastTickAt) / 1000;
+  // Cap delta supaya skip atau sleep/wake nggak nambah jam dengar palsu
+  if (delta <= 2) _currentSession.durationListened += delta;
+  _currentSession.lastTickAt = now;
+}
+
+async function flushListeningSession() {
+  if (_sessionTickInterval) {
+    clearInterval(_sessionTickInterval);
+    _sessionTickInterval = null;
+  }
+  if (!_currentSession) return;
+  const s = _currentSession;
+  _currentSession = null;
+  // Cuma save kalau durasi >= 5 detik (filter skip cepet)
+  if (s.durationListened < 5) return;
+  try {
+    await dbPut(STORE_HISTORY, {
+      trackId: s.trackId,
+      playedAt: s.startedAt,
+      durationListened: Math.round(s.durationListened),
+    });
+    invalidateHistoryCache();
+  } catch (e) { console.warn('Failed to save session', e); }
+}
+
+// Flush saat tab pindah ke background atau closed (best-effort)
+document.addEventListener('visibilitychange', () => {
+  // Saat tab kembali visible, kalau audio masih playing, lanjutkan session yang ada
+  // Saat tab hidden, audio biasanya tetap jalan (di Android Chrome dengan background allow),
+  // jadi tidak perlu flush — biarkan tick interval lanjut
+});
+window.addEventListener('pagehide', () => {
+  // Best-effort flush — kalau page benar-benar di-close
+  flushListeningSession();
+});
+// Flush juga saat audio pause/ended (lagu selesai)
+audio.addEventListener('pause', () => {
+  // Kalau pause >5 detik, anggap session berhenti — flush. Tapi jangan langsung flush
+  // karena user mungkin cuma pause sebentar. Pakai timeout.
+  if (audio.ended) return; // ended handled di event terpisah
+  setTimeout(() => {
+    if (audio.paused && !audio.ended && _currentSession) {
+      flushListeningSession();
+      // Re-prep session kalau user resume nanti — tapi nggak start interval sampai play lagi
+    }
+  }, 10000); // 10 detik
+});
+audio.addEventListener('play', () => {
+  // Resume session: kalau tidak ada session, start one
+  if (!_currentSession && state.currentTrack) {
+    startListeningSession(state.currentTrack.id);
+  } else if (_currentSession) {
+    _currentSession.lastTickAt = Date.now();
+    if (!_sessionTickInterval) {
+      _sessionTickInterval = setInterval(tickListeningSession, 1000);
+    }
+  }
+});
 
 function updateMediaSession(track) {
   if (!('mediaSession' in navigator)) return;
@@ -1400,6 +1502,12 @@ function renderHomeView() {
     return wrap;
   }
 
+  // === Section 0: Stats Dashboard (Sonara Wrapped) ===
+  // Render section dengan placeholder, lalu async load + populate
+  const statsSection = el('div', 'mb-6');
+  wrap.appendChild(statsSection);
+  renderStatsSection(statsSection);
+
   // === Section 1: Putar lagi (recently played, 6 cards) ===
   if (state.recentlyPlayed.length > 0) {
     const recents = state.recentlyPlayed
@@ -1531,6 +1639,185 @@ function renderHomeView() {
 }
 
 // ----- Smart Playlists (auto) -----
+// =====================================================================
+// Stats / Listening Analytics (untuk Dashboard)
+// =====================================================================
+// Cache history di memory supaya komputasi cepat. Refresh dari IndexedDB on demand.
+let _historyCache = null;
+let _historyCacheAt = 0;
+
+async function getHistory(forceRefresh = false) {
+  // Cache 30 detik supaya gak query IndexedDB tiap render
+  if (!forceRefresh && _historyCache && (Date.now() - _historyCacheAt < 30000)) {
+    return _historyCache;
+  }
+  try {
+    const all = await dbGetAll(STORE_HISTORY);
+    _historyCache = all || [];
+    _historyCacheAt = Date.now();
+  } catch (e) { _historyCache = []; }
+  return _historyCache;
+}
+
+function invalidateHistoryCache() { _historyCache = null; }
+
+// Helper: filter history dalam time window
+function filterByPeriod(history, period) {
+  const now = Date.now();
+  let cutoff;
+  switch (period) {
+    case 'today': {
+      // Mulai hari ini jam 00:00
+      const d = new Date(); d.setHours(0, 0, 0, 0);
+      cutoff = d.getTime();
+      break;
+    }
+    case 'week': {
+      // 7 hari ke belakang
+      cutoff = now - 7 * 24 * 60 * 60 * 1000;
+      break;
+    }
+    case 'month': {
+      cutoff = now - 30 * 24 * 60 * 60 * 1000;
+      break;
+    }
+    case 'year': {
+      cutoff = now - 365 * 24 * 60 * 60 * 1000;
+      break;
+    }
+    default: return history; // all-time
+  }
+  return history.filter(h => h.playedAt >= cutoff);
+}
+
+// Total durasi dengar dalam periode (detik)
+function totalSecondsListened(history, period) {
+  const filtered = filterByPeriod(history, period);
+  return filtered.reduce((sum, h) => sum + (h.durationListened || 0), 0);
+}
+
+// Format detik ke "5j 23m" / "23m 45s" / "45s"
+function formatDuration(seconds) {
+  if (!seconds || seconds < 1) return '0m';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return `${h}j ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
+}
+
+// Top N tracks dalam periode, sorted by play count
+function getTopTracksInPeriod(history, period, limit = 10) {
+  const filtered = filterByPeriod(history, period);
+  const counts = new Map();
+  const durations = new Map();
+  for (const h of filtered) {
+    counts.set(h.trackId, (counts.get(h.trackId) || 0) + 1);
+    durations.set(h.trackId, (durations.get(h.trackId) || 0) + (h.durationListened || 0));
+  }
+  return [...counts.entries()]
+    .map(([trackId, count]) => ({
+      track: state.tracks.find(t => t.id === trackId),
+      playCount: count,
+      totalDuration: durations.get(trackId) || 0,
+    }))
+    .filter(x => x.track) // Skip lagu yang udah di-delete
+    .sort((a, b) => b.playCount - a.playCount)
+    .slice(0, limit);
+}
+
+// Top artists dalam periode (by total play count of their tracks)
+function getTopArtistsInPeriod(history, period, limit = 5) {
+  const filtered = filterByPeriod(history, period);
+  const counts = new Map();
+  for (const h of filtered) {
+    const t = state.tracks.find(x => x.id === h.trackId);
+    if (!t) continue;
+    const artist = t.artist || 'Unknown Artist';
+    counts.set(artist, (counts.get(artist) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([name, count]) => ({ name, playCount: count }));
+}
+
+// Top albums dalam periode
+function getTopAlbumsInPeriod(history, period, limit = 5) {
+  const filtered = filterByPeriod(history, period);
+  const counts = new Map();
+  for (const h of filtered) {
+    const t = state.tracks.find(x => x.id === h.trackId);
+    if (!t) continue;
+    const album = t.album || 'Unknown Album';
+    counts.set(album, (counts.get(album) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([name, count]) => ({ name, playCount: count }));
+}
+
+// Streak: berapa hari berturut-turut user dengar musik (mundur dari hari ini)
+function getStreak(history) {
+  if (history.length === 0) return 0;
+  // Set of YYYY-MM-DD strings yang ada listening activity
+  const days = new Set();
+  for (const h of history) {
+    const d = new Date(h.playedAt);
+    days.add(`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`);
+  }
+  let streak = 0;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  for (let i = 0; i < 365; i++) {
+    const d = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
+    const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    if (days.has(key)) streak++;
+    else if (i === 0) continue; // hari ini boleh kosong, lanjut cek kemarin
+    else break;
+  }
+  return streak;
+}
+
+// Histogram jam dengar per hari (last 30 hari) — untuk bar chart
+function getDailyHistogram(history, days = 30) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const result = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
+    const start = d.getTime();
+    const end = start + 24 * 60 * 60 * 1000;
+    const secs = history
+      .filter(h => h.playedAt >= start && h.playedAt < end)
+      .reduce((s, h) => s + (h.durationListened || 0), 0);
+    result.push({ date: d, seconds: secs });
+  }
+  return result;
+}
+
+// Hour-of-day pattern: di jam berapa user paling sering dengar
+function getHourlyPattern(history) {
+  const hours = new Array(24).fill(0);
+  for (const h of history) {
+    const d = new Date(h.playedAt);
+    hours[d.getHours()] += h.durationListened || 0;
+  }
+  return hours;
+}
+
+// Day-of-week pattern (0=Minggu, 6=Sabtu)
+function getDayOfWeekPattern(history) {
+  const days = new Array(7).fill(0);
+  for (const h of history) {
+    const d = new Date(h.playedAt);
+    days[d.getDay()] += h.durationListened || 0;
+  }
+  return days;
+}
+
 function getSmartPlaylists() {
   const result = [];
   const allTracks = state.tracks;
@@ -1610,6 +1897,233 @@ function getGreeting() {
   if (h < 15) return 'Selamat siang';
   if (h < 19) return 'Selamat sore';
   return 'Selamat malam';
+}
+
+// ----- Stats Section (Sonara Wrapped) -----
+// Persistent local state untuk filter periode (gak masuk global state biar gak trigger re-render seluruh app)
+let _statsPeriod = 'week';
+
+async function renderStatsSection(container) {
+  // Placeholder saat loading
+  container.innerHTML = `
+    <div class="bg-gradient-to-br from-purple-900/40 via-pink-900/30 to-orange-900/30 rounded-2xl p-5 mb-4">
+      <div class="flex items-center gap-2 mb-3">
+        <div class="text-2xl">📊</div>
+        <h2 class="text-xl font-bold">Statistik kamu</h2>
+      </div>
+      <div class="text-sm text-spo-textMuted">Memuat...</div>
+    </div>
+  `;
+
+  const history = await getHistory();
+
+  // Kalau belum ada history sama sekali, tampilkan onboarding
+  if (history.length === 0) {
+    container.innerHTML = '';
+    const card = el('div', 'bg-gradient-to-br from-purple-900/40 via-pink-900/30 to-orange-900/30 rounded-2xl p-5');
+    card.innerHTML = `
+      <div class="flex items-center gap-2 mb-2">
+        <div class="text-2xl">📊</div>
+        <h2 class="text-xl font-bold">Statistik kamu</h2>
+      </div>
+      <div class="text-sm text-spo-textMuted">Dengar lagu untuk mulai tracking statistik dengarmu. Data muncul setelah 5 detik dengar pertama.</div>
+    `;
+    container.appendChild(card);
+    return;
+  }
+
+  container.innerHTML = '';
+  const card = el('div', 'bg-gradient-to-br from-purple-900/40 via-pink-900/30 to-orange-900/30 rounded-2xl p-5');
+
+  // Header
+  const header = el('div', 'flex items-center justify-between mb-4');
+  const titleBox = el('div', 'flex items-center gap-2');
+  titleBox.innerHTML = '<div class="text-2xl">📊</div>';
+  titleBox.appendChild(el('h2', 'text-xl font-bold', 'Statistik kamu'));
+  header.appendChild(titleBox);
+  card.appendChild(header);
+
+  // Period tabs
+  const periodRow = el('div', 'flex gap-2 mb-5 overflow-x-auto scroll-y');
+  const periods = [
+    { id: 'today', label: 'Hari ini' },
+    { id: 'week', label: '7 Hari' },
+    { id: 'month', label: '30 Hari' },
+    { id: 'year', label: 'Tahun' },
+    { id: 'all', label: 'Semua' },
+  ];
+  periods.forEach(p => {
+    const btn = el('button', `flex-shrink-0 px-3 py-1 rounded-full text-xs font-semibold transition ${
+      _statsPeriod === p.id ? 'bg-white text-black' : 'bg-white/15 text-white hover:bg-white/25'
+    }`);
+    btn.textContent = p.label;
+    btn.onclick = () => { _statsPeriod = p.id; renderStatsSection(container); };
+    periodRow.appendChild(btn);
+  });
+  card.appendChild(periodRow);
+
+  // === Overview metrics (4 cards) ===
+  const totalSec = totalSecondsListened(history, _statsPeriod);
+  const filtered = filterByPeriod(history, _statsPeriod);
+  const uniqueTracks = new Set(filtered.map(h => h.trackId)).size;
+  const streak = getStreak(history);
+  const totalSessions = filtered.length;
+
+  const metricsGrid = el('div', 'grid grid-cols-2 gap-3 mb-5');
+  [
+    { icon: '⏱️', label: 'Jam dengar', value: formatDuration(totalSec) },
+    { icon: '🎵', label: 'Lagu unik', value: uniqueTracks.toString() },
+    { icon: '🔥', label: 'Streak', value: `${streak} hari` },
+    { icon: '▶️', label: 'Sesi', value: totalSessions.toString() },
+  ].forEach(m => {
+    const mc = el('div', 'bg-black/30 rounded-lg p-3');
+    mc.innerHTML = `
+      <div class="text-xs text-white/60 mb-1">${m.icon} ${m.label}</div>
+      <div class="text-xl font-bold tabular-nums">${m.value}</div>
+    `;
+    metricsGrid.appendChild(mc);
+  });
+  card.appendChild(metricsGrid);
+
+  // === Top Tracks ===
+  const topTracks = getTopTracksInPeriod(history, _statsPeriod, 5);
+  if (topTracks.length > 0) {
+    card.appendChild(el('h3', 'text-sm font-bold uppercase tracking-wider text-white/80 mb-3', 'Top Lagu'));
+    const list = el('div', 'flex flex-col gap-2 mb-5');
+    topTracks.forEach((item, i) => {
+      const row = el('button', 'flex items-center gap-3 hover:bg-white/10 rounded-md p-2 -mx-1 transition text-left');
+      // Rank
+      const rank = el('div', 'w-6 text-center font-bold text-base flex-shrink-0');
+      rank.textContent = `${i+1}`;
+      if (i === 0) rank.classList.add('text-yellow-400');
+      else if (i === 1) rank.classList.add('text-gray-300');
+      else if (i === 2) rank.classList.add('text-orange-400');
+      else rank.classList.add('text-white/50');
+      row.appendChild(rank);
+      // Cover
+      const cov = el('div', 'w-10 h-10 rounded bg-spo-elevated flex-shrink-0');
+      const cu = coverUrl(item.track);
+      if (cu) cov.style.backgroundImage = `url(${cu})`, cov.style.backgroundSize = 'cover';
+      row.appendChild(cov);
+      // Info
+      const info = el('div', 'flex-1 min-w-0');
+      info.appendChild(el('div', 'text-sm font-semibold truncate', item.track.title));
+      info.appendChild(el('div', 'text-xs text-white/60 truncate', item.track.artist));
+      row.appendChild(info);
+      // Count
+      const cnt = el('div', 'flex-shrink-0 text-right');
+      cnt.innerHTML = `<div class="text-sm font-bold tabular-nums">${item.playCount}×</div><div class="text-[10px] text-white/50">${formatDuration(item.totalDuration)}</div>`;
+      row.appendChild(cnt);
+      row.onclick = () => {
+        const idx = state.tracks.findIndex(x => x.id === item.track.id);
+        playFromList(state.tracks, idx, { type: 'library', name: 'Top stats' });
+      };
+      list.appendChild(row);
+    });
+    card.appendChild(list);
+  }
+
+  // === Top Artists ===
+  const topArtists = getTopArtistsInPeriod(history, _statsPeriod, 5);
+  if (topArtists.length > 0) {
+    card.appendChild(el('h3', 'text-sm font-bold uppercase tracking-wider text-white/80 mb-3', 'Top Artis'));
+    const list = el('div', 'flex flex-col gap-1 mb-5');
+    topArtists.forEach((a, i) => {
+      const row = el('div', 'flex items-center gap-3 py-1.5');
+      const rank = el('div', 'w-6 text-center font-bold text-sm text-white/60 flex-shrink-0');
+      rank.textContent = `${i+1}`;
+      row.appendChild(rank);
+      row.appendChild(el('div', 'flex-1 font-semibold text-sm truncate', a.name));
+      const c = el('div', 'text-xs text-white/60 tabular-nums flex-shrink-0');
+      c.textContent = `${a.playCount}×`;
+      row.appendChild(c);
+      list.appendChild(row);
+    });
+    card.appendChild(list);
+  }
+
+  // === Daily activity (last 14 days) — bar chart ===
+  // Hanya tampilkan kalau periode > today
+  if (_statsPeriod !== 'today' && _statsPeriod !== 'all') {
+    const days = _statsPeriod === 'week' ? 7 : 30;
+    const histogram = getDailyHistogram(history, days);
+    const max = Math.max(...histogram.map(d => d.seconds), 1);
+    card.appendChild(el('h3', 'text-sm font-bold uppercase tracking-wider text-white/80 mb-3', 'Aktivitas Harian'));
+    const chart = el('div', 'flex items-end gap-1 h-20 mb-2');
+    histogram.forEach(d => {
+      const h = max > 0 ? Math.max(2, Math.round((d.seconds / max) * 80)) : 2;
+      const bar = el('div', 'flex-1 bg-spo-green rounded-t transition-all');
+      bar.style.height = h + 'px';
+      bar.style.opacity = d.seconds > 0 ? '1' : '0.2';
+      bar.title = `${d.date.toLocaleDateString('id-ID', { weekday: 'short', day: 'numeric', month: 'short' })}: ${formatDuration(d.seconds)}`;
+      chart.appendChild(bar);
+    });
+    card.appendChild(chart);
+    // Label
+    const label = el('div', 'flex justify-between text-[10px] text-white/50');
+    label.innerHTML = `<span>${days} hari yang lalu</span><span>Hari ini</span>`;
+    card.appendChild(label);
+  }
+
+  // === Insight cards (kalau ada data cukup) ===
+  if (_statsPeriod === 'week' || _statsPeriod === 'month') {
+    const allHistory = history;
+    const insights = [];
+
+    // Hari paling intens
+    const hist = getDailyHistogram(allHistory, _statsPeriod === 'week' ? 7 : 30);
+    const peakDay = hist.reduce((max, d) => d.seconds > max.seconds ? d : max, { seconds: 0 });
+    if (peakDay.seconds > 60) {
+      insights.push({
+        emoji: '🏆',
+        title: 'Hari paling intens',
+        body: `${peakDay.date.toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long' })} — ${formatDuration(peakDay.seconds)}`
+      });
+    }
+
+    // Jam favorit
+    const hourly = getHourlyPattern(filtered);
+    const peakHour = hourly.indexOf(Math.max(...hourly));
+    if (hourly[peakHour] > 0) {
+      const label = peakHour < 5 ? 'dini hari' : peakHour < 11 ? 'pagi' : peakHour < 15 ? 'siang' : peakHour < 19 ? 'sore' : 'malam';
+      insights.push({
+        emoji: '🕐',
+        title: 'Jam favorit dengar',
+        body: `Pukul ${peakHour.toString().padStart(2, '0')}:00 (${label})`
+      });
+    }
+
+    // Hari favorit
+    const dow = getDayOfWeekPattern(filtered);
+    const peakDow = dow.indexOf(Math.max(...dow));
+    if (dow[peakDow] > 0) {
+      const dayNames = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+      insights.push({
+        emoji: '📅',
+        title: 'Hari paling musik',
+        body: `${dayNames[peakDow]}`
+      });
+    }
+
+    if (insights.length > 0) {
+      card.appendChild(el('h3', 'text-sm font-bold uppercase tracking-wider text-white/80 mb-3 mt-2', 'Wawasan'));
+      const insightGrid = el('div', 'flex flex-col gap-2');
+      insights.forEach(ins => {
+        const ic = el('div', 'bg-black/30 rounded-lg p-3 flex items-center gap-3');
+        ic.innerHTML = `
+          <div class="text-2xl flex-shrink-0">${ins.emoji}</div>
+          <div class="flex-1 min-w-0">
+            <div class="text-xs text-white/60">${ins.title}</div>
+            <div class="font-semibold text-sm">${escapeHtml(ins.body)}</div>
+          </div>
+        `;
+        insightGrid.appendChild(ic);
+      });
+      card.appendChild(insightGrid);
+    }
+  }
+
+  container.appendChild(card);
 }
 
 // ----- Search -----
