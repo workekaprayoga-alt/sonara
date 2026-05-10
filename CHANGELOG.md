@@ -1,92 +1,109 @@
-# Sonara v8 — Audio quality + Polish
+# Sonara v9 — Music Video Canvas + Lirik Fix
 
-Versi ini fokus di **kualitas audio** dan **visual polish**. Termasuk patch lanjutan v7.1.
+Versi ini ganti **Mode Vinyl → Canvas video / Ken Burns animasi**, plus fix bug lirik tembus vinyl, plus auto-import lirik dari MP3 yang udah punya lirik embedded.
 
-## ✨ Fitur baru
+## 🎬 Fitur baru: Canvas Video (Spotify-style)
 
-### 🎵 Crossfade antar lagu (2–12 detik)
-Lagu yang lagi main fade-out smooth, sambil lagu berikutnya fade-in. Pakai **equal-power crossfade curve** (cos/sin) — bukan linear — supaya transisi terasa konstan tanpa "valley" volume di tengah. Setting di **Pengaturan → Crossfade antar lagu** (slider 0–12 detik, 0 = mati).
+Full player sekarang pakai sistem 2-layer background:
 
-Implementasi pakai **dual audio element**: `audio` (main, EQ chain) + `audioB` (secondary). Saat crossfade window mulai (X detik sebelum lagu A habis), B mulai main dengan volume 0, kedua audio overlap, fade dalam X detik, lalu pindahkan stream B ke `audio` main untuk continue playback dengan EQ tetap aktif.
+### 1. Default — Cover Animasi (Ken Burns)
+Otomatis untuk **semua lagu**. Cover di-blur + zoom-pan pelan (28 detik per cycle), dengan layer kedua yang gerak arah berlawanan 32 detik. Plus color theme adaptif (gradient dari warna dominan cover).
 
-Crossfade auto-cancel kalau user skip manual atau buka full player.
+Saat audio pause, animasi pause di posisi terakhir. Saat resume, lanjut dari titik yang sama.
 
-### 🔗 Gapless playback
-Toggle terpisah dari crossfade. Saat aktif (tanpa crossfade), lagu berikutnya start 0.5 detik lebih awal — hilangkan jeda alami di akhir track. Cocok untuk **album live, mix DJ, classical movement**.
+Hasilnya: full player hidup tanpa user perlu upload apa-apa. Lebih dinamis dari blur statis sebelumnya.
 
-### 🔊 Normalisasi volume
-Toggle di Pengaturan. Saat aktif:
-- Lagu yang belum pernah diputar: peak amplitude diukur otomatis di background (Web Audio decodeAudioData → sample peak), disimpan ke DB
-- Setelah diukur: `audio.volume` di-adjust supaya peak mendekati 0.9 (target), clamp [0.5, 1.0]
-- Lagu lama (yang sudah keras) di-cut sedikit, lagu pelan dibiarkan full
+### 2. Upgrade — Canvas Video (.mp4 / .webm)
+Untuk lagu favorit, user bisa **upload video pendek looping** seperti Spotify Canvas:
+- Tap ⋯ pada lagu → **"Upload Canvas video"**
+- Pilih file .mp4 / .webm (max 25 MB, ideal: 5–15 detik, resolusi 480p–720p)
+- Video disimpan permanen di IndexedDB
+- Saat lagu diputar, video loop di background full player
+- Audio tetap dari MP3 (video di-mute otomatis)
+- Pause audio → pause video juga
 
-Hasilnya: ganti antar lagu nggak ada yang tiba-tiba kaget keras/pelan.
+Untuk hapus: ⋯ → **"Hapus Canvas video"**.
 
-### 💿 Mode Vinyl
-Toggle di Pengaturan. Saat aktif, di full player cover lagu jadi **piringan bulat** dengan **lubang tengah hitam** dan **berputar 360° per 14 detik** (kayak vinyl asli).
+## 🐛 Bug fix penting
 
-Animasi pakai CSS `animation-play-state` — saat audio pause, rotasi paused di posisi terakhir (gak reset ke 0). Saat resume, lanjut dari titik yang sama. Subscribe ke `state.isPlaying` tanpa full re-render supaya rotasi smooth.
+### Lirik tembus background (vinyl/canvas)
+Sebelum: tap LIRIK → lirik nampak transparan di atas vinyl/cover → lirik gak keliatan jelas.
 
-### 😴 Sleep fade-out (30 detik terakhir)
-Toggle di Pengaturan (default ON). Saat sleep timer aktif, di **30 detik terakhir** sebelum auto-pause, volume linear fade dari 1.0 → 0.05. Jangan kaget pas matiin musik buat tidur.
+Sekarang: lyrics panel pakai **solid gradient background** (rgba(0,0,0,0.92) → 0.99). Lirik tampil di atas latar gelap tanpa distraksi dari video/animasi di belakang. Saat lirik ditutup, fade balik ke video/cover animasi smooth.
 
-Volume auto-restore ke 1.0 saat timer dibatalkan atau setelah audio paused.
+### Mode Vinyl dihapus
+Sesuai pilihan: vinyl digantikan total dengan Canvas/Ken Burns. Setting "Mode Vinyl" di Pengaturan dihilangkan.
 
-## 🎛 Pengaturan baru
-Tombol **Pengaturan** (gear icon) di header **Koleksi** kanan atas. Berisi:
+## 🎵 Auto-import lirik dari MP3
 
-**Pemutaran**
-- Slider Crossfade (0–12 detik)
-- Toggle Gapless playback
-- Toggle Normalisasi volume
+Parser ID3 sekarang baca **3 sumber lirik dari MP3**:
 
-**Tampilan**
-- Toggle Mode Vinyl
+1. **USLT** (Unsynchronized Lyrics) — standar resmi ID3v2
+2. **SYLT** (Synchronized Lyrics) — jarang tapi ada, auto-convert ke LRC equivalent
+3. **TXXX** dengan description `lyrics-*` atau `LYRICS` — non-standar tapi banyak dipakai converter YT Music dan tool sejenis (contoh: MP3 Sal Priadi yang kamu test)
 
-**Pengatur Waktu Tidur**
-- Toggle Fade-out saat akan tidur
+Bonus: kalau MP3 punya lirik embedded yang ternyata pakai format LRC (ada timestamp `[mm:ss]`), auto di-convert jadi synced lyrics yang highlight per baris.
 
-Semua setting tersimpan di IndexedDB STORE_META, auto-load saat app start.
+Buffer parser juga diperbesar 256 KB → 1 MB supaya tag besar (lirik panjang + cover art 100+ KB) tetap ke-parse penuh.
 
-## 🐛 Patch v7.1 (re-applied di v8)
-- `dbPut` return auto-generated key (untuk update session record)
-- Periodic save tiap 10 detik (stats muncul cepat tanpa harus ganti lagu)
-- Auto-refresh stats section saat history berubah (`onHistoryChanged` callback)
-- Onboarding text di stats section lebih jelas
+**Prioritas lirik saat import:**
+1. File sidecar .lrc atau .txt (paling akurat)
+2. MP3 USLT
+3. MP3 TXXX:lyrics-*
+4. MP3 SYLT (synced)
 
-## 📊 Roadmap update
+## 📁 File yang berubah
 
-| Versi | Status | Target % Spotify-feel |
-|-------|--------|----------------------|
-| v6 | ✅ Done | ~75% |
-| v7 | ✅ Done | ~82% |
-| **v8** | ✅ **Done** | **~89%** |
-| v9 | Next | ~95% (Tag editor, Backup, Drag-reorder) |
-| v10 | Final | ~99% (Podcast, polish) |
+3 file:
+1. `index.html` — semua perubahan UI + parser
+2. `sw.js` — bump cache `sonara-v14`
+3. `CHANGELOG.md` — (file ini)
 
-## 🚀 Cara deploy
-1. Upload `index.html` + `sw.js` ke GitHub (timpa yang lama)
+## 🚀 Deploy
+1. Upload `index.html` + `sw.js` ke GitHub
 2. Tunggu Vercel redeploy ~30 detik
-3. Di HP: tutup Sonara → buka lagi → SW auto-update ke v13
+3. Tutup app → buka lagi → SW update ke v14
 
 ## ✅ Test checklist
 
-**Crossfade:**
-- ✅ Set crossfade ke 5 detik di Pengaturan
-- ✅ Putar lagu, biarkan main sampai akhir → 5 detik sebelum habis, lagu berikutnya mulai fade-in sambil yang ini fade-out
+**Ken Burns (default):**
+- ✅ Buka full player → cover blur perlahan zoom-pan (gak statis lagi)
+- ✅ Pause audio → animasi berhenti, resume → lanjut dari posisi yang sama
 
-**Gapless:**
-- ✅ Set crossfade ke 0, aktifkan Gapless → coba di album live, jeda antar track hampir hilang
+**Canvas Video:**
+- ✅ ⋯ pada lagu → klik **Upload Canvas video** → pilih .mp4 → toast "Canvas video tersimpan ✨"
+- ✅ Buka full player → video loop di background
+- ✅ Pause audio → video ikut pause
+- ✅ ⋯ lagi → **Hapus Canvas video** → balik ke Ken Burns mode
 
-**Normalisasi volume:**
-- ✅ Aktifkan toggle → putar lagu yang biasanya keras dan yang pelan secara bergantian → seharusnya volume lebih konsisten (butuh 1 kali putar tiap lagu untuk kalibrasi)
+**Lirik di atas Canvas:**
+- ✅ Buka full player dengan canvas/cover → tap LIRIK → lirik muncul di latar gelap solid (gak tembus)
+- ✅ Tap LIRIK lagi → fade balik ke video/cover
 
-**Mode Vinyl:**
-- ✅ Aktifkan toggle → buka full player → cover berbentuk lingkaran berputar pelan
-- ✅ Pause → rotasi berhenti di posisi terakhir → resume → lanjut dari sana
+**Auto-import lirik (penting buat dicoba):**
+- ✅ Import ulang MP3 Sal Priadi → lirik auto-muncul (gak perlu paste manual)
+- ✅ Buka full player → tombol "LIRIK" muncul otomatis di top bar
 
-**Sleep fade-out:**
-- ✅ Set sleep timer 1 menit → biarkan jalan → 30 detik terakhir volume turun perlahan
+## 📊 Roadmap
 
-**Tombol kembali:**
-- ✅ Buka Pengaturan → tekan tombol kembali Android → sheet tutup smooth (bukan keluar app)
+| Versi | Status | % Spotify-feel |
+|-------|--------|----------------|
+| v8 | ✅ Done | ~89% |
+| v9 | ✅ Done | ~93% |
+| v10 | Next | ~97% (Backup/Restore, Tag editor, Drag-reorder, Bulk ops) |
+| v11 | Final | ~99% (Podcast, micro-interactions) |
+
+## 💡 Tips Canvas video
+
+Resolusi & ukuran ideal:
+- **480p** (854×480) → ukuran 2–5 MB → loading cepat, kualitas cukup di HP
+- **720p** (1280×720) → ukuran 5–15 MB → premium feel
+- **Hindari 1080p** kecuali video sangat pendek (< 5 detik) → boros storage
+
+Sumber Canvas video (legal):
+- Record sendiri (10 detik dari video musik di YouTube lalu screen-record)
+- Convert dari GIF favorit (banyak converter online: gif-to-mp4)
+- Pinterest/IG Reels download
+- Live wallpaper APK extractor
+
+Saran format: **MP4 H.264** paling kompatibel di semua browser HP.
