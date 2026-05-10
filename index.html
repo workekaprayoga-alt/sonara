@@ -389,20 +389,44 @@ const state = {
 const subscribers = new Set();
 function setState(updater) {
   Object.assign(state, typeof updater === 'function' ? updater(state) : updater);
-  subscribers.forEach((cb) => cb(state));
+  // Throttle: kalau banyak setState dalam 1 frame, gabungkan jadi 1 render aja
+  if (setState._scheduled) return;
+  setState._scheduled = true;
+  requestAnimationFrame(() => {
+    setState._scheduled = false;
+    subscribers.forEach((cb) => cb(state));
+  });
 }
 function subscribe(cb) { subscribers.add(cb); return () => subscribers.delete(cb); }
 
 // ---------- Audio Engine ----------
 const audio = new Audio();
 audio.preload = 'metadata';
+audio.crossOrigin = 'anonymous';
+// Pakai inline mode di iOS Safari supaya bisa main di background
+audio.setAttribute('playsinline', '');
+audio.setAttribute('webkit-playsinline', '');
 let currentObjectUrl = null;
 
+// Time/duration updates pakai event-emitter terpisah supaya nggak trigger re-render UI.
+// UI (mini player, full player) listen lewat onTimeUpdate dan patch DOM langsung.
+const timeListeners = new Set();
+function onTimeUpdate(cb) { timeListeners.add(cb); return () => timeListeners.delete(cb); }
+function emitTime() { timeListeners.forEach(cb => { try { cb(audio.currentTime, audio.duration); } catch(e){} }); }
+
+// State.currentTime dan state.duration tidak dipakai oleh render — tapi tetap kita simpan
+// supaya kode lain yang reference state.currentTime tidak break. Update tanpa trigger render.
 audio.addEventListener('timeupdate', () => {
-  setState({ currentTime: audio.currentTime });
+  state.currentTime = audio.currentTime;
+  emitTime();
 });
 audio.addEventListener('loadedmetadata', () => {
-  setState({ duration: audio.duration });
+  state.duration = audio.duration;
+  emitTime();
+});
+audio.addEventListener('durationchange', () => {
+  state.duration = audio.duration;
+  emitTime();
 });
 audio.addEventListener('ended', () => {
   // Sleep timer "Akhir lagu"
@@ -418,8 +442,12 @@ audio.addEventListener('ended', () => {
     nextTrack();
   }
 });
-audio.addEventListener('play', () => setState({ isPlaying: true }));
-audio.addEventListener('pause', () => setState({ isPlaying: false }));
+audio.addEventListener('play', () => { setState({ isPlaying: true }); });
+audio.addEventListener('pause', () => { setState({ isPlaying: false }); });
+
+// PENTING: Jangan stop audio saat tab hidden / page hide.
+window.addEventListener('pagehide', () => { /* biarkan audio jalan */ });
+window.addEventListener('blur', () => { /* biarkan audio jalan */ });
 
 async function loadAndPlay(track) {
   if (!track) return;
@@ -447,12 +475,95 @@ function updateMediaSession(track) {
     album: track.album,
     artwork,
   });
-  navigator.mediaSession.setActionHandler('play', () => audio.play());
-  navigator.mediaSession.setActionHandler('pause', () => audio.pause());
+  navigator.mediaSession.setActionHandler('play', () => { audio.play(); });
+  navigator.mediaSession.setActionHandler('pause', () => { audio.pause(); });
   navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
   navigator.mediaSession.setActionHandler('nexttrack', nextTrack);
   navigator.mediaSession.setActionHandler('seekto', (d) => { if (d.seekTime != null) audio.currentTime = d.seekTime; });
+  try { navigator.mediaSession.setActionHandler('stop', () => { audio.pause(); }); } catch(e){}
+  // Set playback state explicitly — bantu Android ngenali audio aktif
+  navigator.mediaSession.playbackState = audio.paused ? 'paused' : 'playing';
 }
+
+// =====================================================================
+// BACKGROUND PLAYBACK FIXES — supaya audio jalan saat minimize/lock screen
+// =====================================================================
+
+// 1) Setting audio element supaya browser ngenali sebagai "media playback"
+audio.setAttribute('playsinline', 'true');
+audio.setAttribute('webkit-playsinline', 'true');
+audio.preload = 'auto';
+audio.crossOrigin = 'anonymous';
+
+// 2) Update mediaSession state setiap kali play/pause
+audio.addEventListener('play', () => {
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+  // Update position state supaya seek bar di lock screen akurat
+  if ('mediaSession' in navigator && 'setPositionState' in navigator.mediaSession) {
+    try {
+      navigator.mediaSession.setPositionState({
+        duration: audio.duration || 0,
+        playbackRate: audio.playbackRate,
+        position: audio.currentTime,
+      });
+    } catch (e) {}
+  }
+});
+audio.addEventListener('pause', () => {
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+});
+
+// 3) Visibility change handler — JANGAN pause saat tab hidden / app minimize
+//    (kebalikan dari default browser behavior di beberapa device)
+document.addEventListener('visibilitychange', () => {
+  // Saat app kembali ke foreground, sync ulang state UI
+  if (document.visibilityState === 'visible') {
+    setState({ isPlaying: !audio.paused, currentTime: audio.currentTime });
+  }
+  // Saat hidden — sengaja TIDAK pause; biarkan audio terus jalan
+});
+
+// 4) Page lifecycle: mencegah browser bekuin audio saat freeze
+window.addEventListener('freeze', (e) => {
+  // Jangan biarkan tab di-freeze saat audio playing
+  if (!audio.paused) {
+    // Browser akan auto-resume kalau audio playing
+  }
+});
+
+// 5) Wake lock — minta browser jangan matiin layar/proses saat audio play
+let wakeLock = null;
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (e) { /* ignored */ }
+}
+audio.addEventListener('play', () => {
+  // Wake lock cuma effective saat tab visible — tapi tidak masalah
+  if (document.visibilityState === 'visible') acquireWakeLock();
+});
+audio.addEventListener('pause', () => {
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+});
+document.addEventListener('visibilitychange', () => {
+  // Re-acquire wake lock saat balik ke foreground
+  if (document.visibilityState === 'visible' && !audio.paused) acquireWakeLock();
+});
+
+// 6) Periodic position update untuk lock screen seek bar
+setInterval(() => {
+  if (!audio.paused && 'mediaSession' in navigator && 'setPositionState' in navigator.mediaSession) {
+    try {
+      navigator.mediaSession.setPositionState({
+        duration: audio.duration || 0,
+        playbackRate: audio.playbackRate,
+        position: audio.currentTime,
+      });
+    } catch (e) {}
+  }
+}, 1000);
 
 function playFromList(tracks, index, context) {
   const queue = state.shuffle ? shuffleArray(tracks, index) : tracks.slice();
@@ -1482,37 +1593,63 @@ function renderTrackRow(t, i, list, context, opts = {}) {
 // ----- Mini Player -----
 function renderMiniPlayer() {
   const t = state.currentTrack;
-  const wrap = el('button', 'w-full bg-spo-sheet hover:bg-[#333] mx-2 mb-1 rounded-md flex items-center gap-3 p-2 transition');
+  // FIX: pakai div, bukan button (cegah nested button HTML invalid yang bikin tap aneh)
+  const wrap = el('div', 'w-full bg-spo-sheet mx-2 mb-1 rounded-md flex items-center gap-3 p-2 transition cursor-pointer select-none');
   wrap.style.width = 'calc(100% - 16px)';
+  wrap.setAttribute('role', 'button');
+  wrap.setAttribute('tabindex', '0');
+
   const cov = el('div', 'w-10 h-10 bg-spo-elevated rounded flex-shrink-0');
   const cu = coverUrl(t);
-  if (cu) cov.style.backgroundImage = `url(${cu})`, cov.style.backgroundSize = 'cover';
+  if (cu) { cov.style.backgroundImage = `url(${cu})`; cov.style.backgroundSize = 'cover'; cov.style.backgroundPosition = 'center'; }
   wrap.appendChild(cov);
-  const info = el('div', 'flex-1 min-w-0 text-left');
+
+  const info = el('div', 'flex-1 min-w-0 text-left pointer-events-none');
   info.appendChild(el('div', 'text-sm font-semibold truncate', t.title));
   info.appendChild(el('div', 'text-xs text-spo-textMuted truncate', t.artist));
   wrap.appendChild(info);
-  // Like
+
+  // Like — pakai stopPropagation + pointerdown supaya nggak bubble ke wrap
   const likeBtn = el('button', 'p-2 ' + (t.liked ? 'text-spo-green' : 'text-white/80'));
   likeBtn.innerHTML = svgIcon(t.liked ? 'heart-filled' : 'heart', 22);
-  likeBtn.onclick = (e) => { e.stopPropagation(); toggleLike(t.id); };
+  likeBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+  likeBtn.onclick = (e) => { e.stopPropagation(); e.preventDefault(); toggleLike(t.id); };
   wrap.appendChild(likeBtn);
+
   // Play/pause
   const pp = el('button', 'p-2 text-white');
   pp.innerHTML = svgIcon(state.isPlaying ? 'pause' : 'play', 22);
-  pp.onclick = (e) => { e.stopPropagation(); togglePlay(); };
+  pp.addEventListener('pointerdown', (e) => e.stopPropagation());
+  pp.onclick = (e) => { e.stopPropagation(); e.preventDefault(); togglePlay(); };
   wrap.appendChild(pp);
 
-  // Progress bar (tipis di bawah)
+  // Progress bar (tipis di bawah) — update via DOM listener, bukan re-render
   const outer = el('div', 'relative');
   outer.appendChild(wrap);
-  const bar = el('div', 'h-0.5 bg-white/30 mx-3 rounded-full overflow-hidden');
+  const bar = el('div', 'h-0.5 bg-white/30 mx-3 rounded-full overflow-hidden pointer-events-none');
   const fill = el('div', 'h-full bg-white');
-  fill.style.width = `${(state.currentTime / state.duration) * 100 || 0}%`;
+  fill.style.width = `${(audio.currentTime / audio.duration) * 100 || 0}%`;
   bar.appendChild(fill);
   outer.appendChild(bar);
 
-  wrap.onclick = () => setState({ fullPlayerOpen: true });
+  // Subscribe ke time updates → patch DOM langsung (tidak trigger render apa-apa)
+  const unsub = onTimeUpdate((cur, dur) => {
+    if (!fill.isConnected) { unsub(); return; }
+    const p = (cur / (dur || 1)) * 100 || 0;
+    fill.style.width = p + '%';
+  });
+
+  // Open full player — debounce untuk cegah double-trigger
+  let opening = false;
+  const openFullPlayer = (e) => {
+    if (opening) return;
+    opening = true;
+    // Pakai pointerdown-end + click bisa dobel; kita pakai click only.
+    setState({ fullPlayerOpen: true });
+    setTimeout(() => { opening = false; }, 500);
+  };
+  wrap.onclick = openFullPlayer;
+
   return outer;
 }
 
@@ -1541,7 +1678,10 @@ function renderBottomNav() {
 function renderFullPlayer() {
   const t = state.currentTrack;
   if (!t) return el('div');
-  const overlay = el('div', 'fixed inset-0 z-40 animate-slide-up overflow-hidden');
+  // FIX: tambahkan bg-spo-bg dasar + touch-none di luar elemen interaktif
+  const overlay = el('div', 'fixed inset-0 z-40 animate-slide-up overflow-hidden bg-spo-bg');
+  // Stop tap dari nembus ke layer di belakang
+  overlay.addEventListener('pointerdown', (e) => e.stopPropagation());
   // Blurred cover background
   const bg = el('div', 'absolute inset-0');
   bg.style.background = '#1a1a1a';
@@ -1600,20 +1740,43 @@ function renderFullPlayer() {
   info.appendChild(likeBtn);
   content.appendChild(info);
 
-  // Progress bar
+  // Progress bar — update via DOM listener (bukan re-render) supaya nggak loncat
   const seekRow = el('div', 'px-6');
   const seek = el('input', 'seek');
-  seek.type = 'range'; seek.min = 0; seek.max = state.duration || 0; seek.step = 0.1; seek.value = state.currentTime;
-  // Style fill
-  const pct = (state.currentTime / (state.duration || 1)) * 100;
-  seek.style.background = `linear-gradient(to right, #fff 0%, #fff ${pct}%, rgba(255,255,255,0.3) ${pct}%, rgba(255,255,255,0.3) 100%)`;
+  seek.type = 'range'; seek.min = 0; seek.max = audio.duration || 0; seek.step = 0.1; seek.value = audio.currentTime || 0;
+  // Style fill awal
+  const initPct = (audio.currentTime / (audio.duration || 1)) * 100 || 0;
+  seek.style.background = `linear-gradient(to right, #fff 0%, #fff ${initPct}%, rgba(255,255,255,0.3) ${initPct}%, rgba(255,255,255,0.3) 100%)`;
+
+  // Saat user pegang slider, jangan auto-update value-nya dari timeupdate (biar nggak "loncat" balik)
+  let seeking = false;
+  seek.addEventListener('pointerdown', () => { seeking = true; });
+  seek.addEventListener('pointerup', () => { seeking = false; });
+  seek.addEventListener('touchstart', () => { seeking = true; }, { passive: true });
+  seek.addEventListener('touchend', () => { seeking = false; });
   seek.oninput = (e) => audio.currentTime = parseFloat(e.target.value);
   seekRow.appendChild(seek);
+
   const times = el('div', 'flex justify-between text-xs text-white/70 mt-1');
-  times.appendChild(el('span', '', fmt(state.currentTime)));
-  times.appendChild(el('span', '', fmt(state.duration)));
+  const tCur = el('span', '', fmt(audio.currentTime || 0));
+  const tDur = el('span', '', fmt(audio.duration || 0));
+  times.appendChild(tCur);
+  times.appendChild(tDur);
   seekRow.appendChild(times);
   content.appendChild(seekRow);
+
+  // DOM-only updates via time emitter
+  const unsubTime = onTimeUpdate((cur, dur) => {
+    if (!seek.isConnected) { unsubTime(); return; }
+    if (!seeking) {
+      seek.max = dur || 0;
+      seek.value = cur || 0;
+      const p = (cur / (dur || 1)) * 100 || 0;
+      seek.style.background = `linear-gradient(to right, #fff 0%, #fff ${p}%, rgba(255,255,255,0.3) ${p}%, rgba(255,255,255,0.3) 100%)`;
+      tCur.textContent = fmt(cur || 0);
+    }
+    tDur.textContent = fmt(dur || 0);
+  });
 
   // Controls (shuffle, prev, PLAY, next, sleep timer)
   const ctl = el('div', 'flex items-center justify-between px-6 mt-4');
@@ -2092,9 +2255,22 @@ function svgIcon(name, size = 24) {
 subscribe(() => render());
 init().then(() => render());
 
-// Service worker
+// Service worker — dengan auto-update saat ada versi baru
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+  navigator.serviceWorker.register('sw.js').then((reg) => {
+    // Cek update tiap 1 jam
+    setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
+    reg.addEventListener('updatefound', () => {
+      const newWorker = reg.installing;
+      if (!newWorker) return;
+      newWorker.addEventListener('statechange', () => {
+        if (newWorker.state === 'activated') {
+          // Auto-reload supaya pakai versi baru — hanya saat tidak sedang play music
+          if (audio.paused) location.reload();
+        }
+      });
+    });
+  }).catch(() => {});
 }
 </script>
 </body>

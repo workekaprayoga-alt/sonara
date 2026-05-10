@@ -1,5 +1,5 @@
-// Sonara Service Worker
-const CACHE = 'sonara-v2';
+// Sonara Service Worker v4
+const CACHE = 'sonara-v4';
 const CORE = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -15,7 +15,11 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
-  // Network-first untuk Tailwind CDN
+
+  // Jangan ganggu request blob: (audio dari IndexedDB) atau data:
+  if (url.protocol === 'blob:' || url.protocol === 'data:') return;
+
+  // Network-first untuk CDN
   if (url.hostname === 'cdn.tailwindcss.com' || url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com') {
     e.respondWith(
       fetch(e.request).then((r) => {
@@ -26,14 +30,31 @@ self.addEventListener('fetch', (e) => {
     );
     return;
   }
-  // Cache-first untuk asset lokal
-  e.respondWith(
-    caches.match(e.request).then((cached) => cached || fetch(e.request).then((r) => {
-      if (e.request.method === 'GET' && r.ok) {
-        const copy = r.clone();
-        caches.open(CACHE).then((c) => c.put(e.request, copy));
-      }
-      return r;
-    }))
-  );
+
+  // Cache-first untuk asset lokal — KECUALI index.html (network-first supaya update cepet sampai)
+  if (url.origin === self.location.origin) {
+    const isHtml = url.pathname === '/' || url.pathname.endsWith('/index.html') || url.pathname.endsWith('/');
+    if (isHtml) {
+      // Network-first: coba ambil yang baru, kalau offline fallback ke cache
+      e.respondWith(
+        fetch(e.request).then((r) => {
+          if (r.ok) {
+            const copy = r.clone();
+            caches.open(CACHE).then((c) => c.put(e.request, copy));
+          }
+          return r;
+        }).catch(() => caches.match(e.request) || caches.match('./index.html'))
+      );
+      return;
+    }
+    e.respondWith(
+      caches.match(e.request).then((cached) => cached || fetch(e.request).then((r) => {
+        if (e.request.method === 'GET' && r.ok) {
+          const copy = r.clone();
+          caches.open(CACHE).then((c) => c.put(e.request, copy));
+        }
+        return r;
+      }))
+    );
+  }
 });

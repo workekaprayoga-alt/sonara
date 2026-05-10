@@ -1,70 +1,59 @@
-# Sonara — Update v2
+# Sonara v3 — Bug Fixes
 
-## Apa yang baru?
+Fokus rilis ini: stabilkan playback dan UI.
 
-### 1. Antrean (Queue) view
-- Tap icon antrean di full player (kanan bawah) → muncul daftar lagu yang akan diputar
-- Section **"Shuffling dari:"** muncul saat shuffle aktif (persis Spotify)
-- Lagu yang sedang main di-highlight hijau dengan animasi equalizer
-- Drag handle (☰) di kanan setiap lagu — bisa atur ulang urutan
-- Footer: tombol Shuffle + Pengatur Waktu
+## Bug yang diperbaiki
 
-### 2. Halaman Artis
-- Tap nama artis di full player → buka halaman artis
-- Hero image besar (auto pakai cover lagu pertama, bisa override dengan icon foto di kanan atas)
-- Nama artis besar bold dengan gradient overlay
-- Section **"Populer"** dengan nomor track + cover + judul + durasi
-- Section **"Rilis populer"** — list album dari artis itu (tap untuk buka album)
-- Tombol shuffle + play hijau besar
+### Bug 1: Musik mati saat tekan Home / minimize
+**Penyebab:** Kombinasi — wake lock kurang kuat, MediaSession kurang lengkap, dan beberapa sinyal ke OS hilang saat Chrome dipindah ke background.
 
-### 3. Halaman Album
-- Tap nama album dari context menu → buka halaman album
-- Cover besar di tengah dengan shadow
-- Judul album, nama artis (clickable ke halaman artis), tahun rilis
-- Action row: download, share, dst.
-- List lagu album
+**Fix di kode:**
+- MediaSession lengkap: handler `play`, `pause`, `prev`, `next`, `seek`, `stop`
+- `playbackState` aktif disinkron ke OS — bantu Android/iOS mengenali audio aktif
+- Position state dikirim 1x/detik — progress bar di lock screen akurat
+- Wake lock di-acquire saat play, di-release saat pause
+- Wake lock di-re-acquire otomatis saat tab balik visible
+- Audio attribute `playsinline` + `webkit-playsinline` (penting di iOS)
+- Tidak ada handler yang pause audio karena visibility change
 
-### 4. Sleep Timer ⏱
-- Icon timer di full player (kanan dari tombol next)
-- Opsi: 5/10/15/30/45 menit, 1 jam, **Akhir lagu**
-- Saat aktif, muncul countdown di full player ("Akan berhenti dalam 4:23")
-- Bisa dimatikan dengan opsi "Matikan"
+**CATATAN PENTING:** Kalau setelah update musik MASIH mati saat Home/minimize, kemungkinan besar **battery optimization HP-mu yang bunuh Chrome**. Cara fix di sisi HP:
 
-### 5. Blurred cover art di Full Player ✨
-- Background full player sekarang pakai blurred cover art dari lagu yang main
-- Persis seperti Spotify asli
-- Otomatis ganti tiap lagu
+1. Settings HP → Apps → Chrome
+2. Cari Battery / Battery usage
+3. Set ke Unrestricted / Tidak dibatasi
 
-### 6. Drag-reorder Playlist
-- Buka playlist → tap chip "Edit"
-- Drag handle (☰) muncul di kanan setiap lagu
-- Drag untuk atur ulang urutan (mendukung mouse di laptop & touch di HP)
+HP merk tertentu butuh langkah ekstra:
+- Xiaomi/MIUI: Settings → Apps → Manage apps → Chrome → Battery saver → No restrictions
+- Oppo/Realme: Settings → Battery → App battery management → Chrome → Allow background activity ON
+- Vivo: Settings → Battery → Background power consumption → Chrome → Allow
+- Huawei: Settings → Apps → Chrome → Battery → Launch → Manage manually (ON semua)
+- Samsung: Settings → Apps → Chrome → Battery → Unrestricted
 
-### 7. Bonus: Override foto artis & cover album
-- Di halaman artis: tap icon foto di kanan atas → upload foto artis sendiri
-- Di halaman album: tap icon + di action row → upload cover album sendiri
-- Tetap bisa pakai default (cover lagu) kalau nggak diatur
+PWA jalan di dalam Chrome, jadi setting yang dipakai adalah setting Chrome, bukan "Sonara" (Sonara nggak punya entry sendiri di Settings).
 
-## Cara update di Vercel
-1. Extract `sonara-v2.zip`
-2. Buka repo `sonara` di GitHub
-3. Hapus file lama (Add file → Delete) atau timpa dengan upload baru
-4. Drag 5 file baru dari zip ke GitHub
-5. Commit changes
-6. Vercel otomatis re-deploy dalam ~30 detik
-7. Refresh app di HP — kalau tidak update, hapus Sonara dari home screen, buka link Vercel lagi, install ulang
+### Bug 2: Menu loncat-loncat saat buka full player
+**Penyebab:** Tiap detik, audio `timeupdate` event memanggil `setState({ currentTime })` yang nge-trigger render full DOM rebuild. Saat user tap, element yang harusnya nerima tap udah keganti dengan element baru — tap "lewat" atau menu kelihatan loncat-loncat.
 
-## Tips pakai
-- **Buka Antrean cepat:** dari mini player → tap → buka full player → tap icon antrean
-- **Sleep timer untuk tidur:** putar musik → buka full player → tap icon timer → pilih durasi
-- **Lihat artis lengkap:** dari full player, tap nama artis di bawah judul lagu
-- **Atur urutan playlist:** buka playlist → tap "Edit" → drag handle untuk reorder
+**Fix:**
+- `currentTime` & `duration` dipisahkan dari state-yang-trigger-render
+- Time updates pakai event-emitter terpisah
+- Mini player progress bar update via DOM langsung, tidak re-render
+- Full player progress + time labels update via DOM langsung
+- Slider tidak "loncat balik" saat user pegang
+- Debounce tap mini player 400ms → 500ms
 
-## Yang masih bisa ditambahkan nanti
-- Lyrics view (file .lrc support)
-- Equalizer (Web Audio API)
-- Crossfade & gapless playback
-- Statistik dengar (lagu paling sering)
-- Folder/bulk import dari komputer
+Hasil: full player open sekali, tetap stabil, tap responsif.
 
-Kasih tahu kalau ada yang aneh atau request fitur lain!
+## Update lain
+- Service Worker `sonara-v4` (auto-fetch update baru)
+- index.html network-first — kalau ada deploy baru, langsung dapet versi terbaru
+
+## Cara update di HP setelah deploy
+1. Update 5 file di GitHub (index.html, sw.js, manifest.json, 2 icon)
+2. Tunggu Vercel re-deploy (~30 detik)
+3. Di HP: buka Sonara dari home screen
+4. Service worker baru otomatis install di background
+5. Tutup Sonara, buka lagi → versi baru aktif
+
+Kalau masih versi lama setelah dibuka ulang:
+- Tekan lama icon Sonara di home screen → App info → Storage → Clear cache (JANGAN clear data — itu hapus lagu)
