@@ -76,6 +76,14 @@
     from { opacity: 0; }
     to { opacity: 1; }
   }
+  @keyframes fadeOut {
+    from { opacity: 1; }
+    to { opacity: 0; }
+  }
+  /* Class util untuk close animation */
+  .closing-sheet { animation: slideDown 240ms cubic-bezier(0.32, 0.72, 0, 1) forwards; }
+  .closing-backdrop { animation: fadeOut 240ms ease-out forwards; }
+  .closing-fullplayer { animation: slideDown 280ms cubic-bezier(0.32, 0.72, 0, 1) forwards; }
   @keyframes eqBar {
     0%, 100% { height: 30%; }
     50% { height: 100%; }
@@ -464,6 +472,18 @@ async function loadAndPlay(track) {
   const rp = [track.id, ...state.recentlyPlayed.filter(id => id !== track.id)].slice(0, 50);
   setState({ recentlyPlayed: rp });
   await dbPut(STORE_META, { key: 'recentlyPlayed', value: rp });
+
+  // Increment play count + update lastPlayedAt (untuk Top Tracks & Smart Playlist)
+  // Pakai timer 5 detik supaya nggak hitung kalau user skip cepet.
+  if (loadAndPlay._countTimer) clearTimeout(loadAndPlay._countTimer);
+  loadAndPlay._countTimer = setTimeout(async () => {
+    const t = state.tracks.find(x => x.id === track.id);
+    if (!t || state.currentTrack?.id !== track.id) return;
+    t.playCount = (t.playCount || 0) + 1;
+    t.lastPlayedAt = Date.now();
+    try { await dbPut(STORE_TRACKS, t); } catch (e) {}
+    setState({ tracks: [...state.tracks] });
+  }, 5000);
 }
 
 function updateMediaSession(track) {
@@ -681,9 +701,32 @@ async function getAlbumImage(albumName) {
 
 // ---------- Library actions ----------
 async function importFiles(fileList) {
-  const files = Array.from(fileList).filter(f => f.type.startsWith('audio/') || /\.(mp3|m4a|flac|wav|ogg|aac)$/i.test(f.name));
-  for (const file of files) {
+  const allFiles = Array.from(fileList);
+  const audioFiles = allFiles.filter(f => f.type.startsWith('audio/') || /\.(mp3|m4a|flac|wav|ogg|aac)$/i.test(f.name));
+  const lyricFiles = allFiles.filter(f => /\.(lrc|txt)$/i.test(f.name));
+
+  // Map basename → lyric file (untuk auto-pair)
+  const lyricMap = {};
+  for (const lf of lyricFiles) {
+    const base = lf.name.replace(/\.(lrc|txt)$/i, '').toLowerCase();
+    lyricMap[base] = lf;
+  }
+
+  for (const file of audioFiles) {
     const meta = await extractMetadata(file);
+    const audioBase = file.name.replace(/\.(mp3|m4a|flac|wav|ogg|aac)$/i, '').toLowerCase();
+    let lyrics = null, lyricsSynced = null;
+    // Auto-pair lirik
+    if (lyricMap[audioBase]) {
+      const lyricText = await lyricMap[audioBase].text();
+      const isLrc = /\.lrc$/i.test(lyricMap[audioBase].name);
+      if (isLrc) {
+        lyricsSynced = parseLrc(lyricText);
+        lyrics = lyricText;
+      } else {
+        lyrics = lyricText;
+      }
+    }
     const track = {
       id: uid(),
       title: meta.title,
@@ -694,9 +737,133 @@ async function importFiles(fileList) {
       cover: meta.cover,
       liked: false,
       addedAt: Date.now(),
+      playCount: 0,
+      lastPlayedAt: null,
+      lyrics,
+      lyricsSynced,
     };
     await dbPut(STORE_TRACKS, track);
     setState((s) => ({ tracks: [...s.tracks, track] }));
+  }
+}
+
+// ----- LRC parser (synced lyrics) -----
+// Format: [mm:ss.xx]Lyric text  → { time: seconds, text: 'Lyric text' }
+function parseLrc(text) {
+  const lines = text.split(/\r?\n/);
+  const result = [];
+  const re = /\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]/g;
+  for (const line of lines) {
+    const matches = [...line.matchAll(re)];
+    if (matches.length === 0) continue;
+    const lyricText = line.replace(re, '').trim();
+    if (!lyricText) continue;
+    for (const m of matches) {
+      const min = parseInt(m[1], 10);
+      const sec = parseInt(m[2], 10);
+      const ms = m[3] ? parseInt(m[3].padEnd(3, '0'), 10) : 0;
+      const time = min * 60 + sec + ms / 1000;
+      result.push({ time, text: lyricText });
+    }
+  }
+  result.sort((a, b) => a.time - b.time);
+  return result.length > 0 ? result : null;
+}
+
+// ----- Set / clear lyrics on a track manually -----
+async function setTrackLyrics(trackId, text) {
+  const t = state.tracks.find(x => x.id === trackId);
+  if (!t) return;
+  if (!text || !text.trim()) {
+    t.lyrics = null;
+    t.lyricsSynced = null;
+  } else {
+    const synced = parseLrc(text);
+    t.lyrics = text;
+    t.lyricsSynced = synced;
+  }
+  await dbPut(STORE_TRACKS, t);
+  setState({ tracks: [...state.tracks] });
+  // Update currentTrack reference juga kalau lagi diputar
+  if (state.currentTrack?.id === trackId) setState({ currentTrack: t });
+}
+
+// ----- LRCLIB auto-fetch (free, no API key) -----
+// API: https://lrclib.net/docs
+// Saat user request fetch, kita coba 3 strategi:
+// 1. Exact match by track_name + artist_name + (album_name + duration)
+// 2. Search by track_name + artist_name (loose)
+// 3. Search by track_name only (last resort)
+async function fetchLyricsFromLrclib(track, opts = {}) {
+  if (!track) return { ok: false, error: 'Track kosong' };
+  if (!navigator.onLine) return { ok: false, error: 'Tidak ada koneksi internet' };
+
+  const enc = encodeURIComponent;
+  const tries = [
+    // Get exact: paling akurat, butuh duration
+    {
+      url: `https://lrclib.net/api/get?track_name=${enc(track.title)}&artist_name=${enc(track.artist)}&album_name=${enc(track.album || '')}&duration=${Math.round(track.duration || 0)}`,
+      isList: false,
+    },
+    // Search by track + artist
+    {
+      url: `https://lrclib.net/api/search?track_name=${enc(track.title)}&artist_name=${enc(track.artist)}`,
+      isList: true,
+    },
+    // Search by track only
+    {
+      url: `https://lrclib.net/api/search?track_name=${enc(track.title)}`,
+      isList: true,
+    },
+  ];
+
+  for (const t of tries) {
+    try {
+      const res = await fetch(t.url, { headers: { 'User-Agent': 'Sonara/1.0 (personal music player)' } });
+      if (!res.ok) continue;
+      const data = await res.json();
+      let candidate = null;
+      if (t.isList) {
+        if (Array.isArray(data) && data.length > 0) candidate = data[0];
+      } else {
+        if (data && (data.syncedLyrics || data.plainLyrics)) candidate = data;
+      }
+      if (!candidate) continue;
+      // Prefer synced
+      const synced = candidate.syncedLyrics;
+      const plain = candidate.plainLyrics;
+      if (synced) {
+        return { ok: true, text: synced, isSynced: true, source: 'LRCLIB' };
+      }
+      if (plain) {
+        return { ok: true, text: plain, isSynced: false, source: 'LRCLIB' };
+      }
+    } catch (e) {
+      // Continue ke try berikutnya
+    }
+  }
+  return { ok: false, error: 'Lirik tidak ditemukan di LRCLIB' };
+}
+
+async function autoFetchAndApplyLyrics(track) {
+  const result = await fetchLyricsFromLrclib(track);
+  if (!result.ok) return result;
+  await setTrackLyrics(track.id, result.text);
+  return result;
+}
+
+// Quick fetch with toast feedback (dipanggil dari context menu shortcut)
+async function quickFetchLyrics(track) {
+  showToast('Mencari lirik di LRCLIB...', 2000);
+  try {
+    const result = await autoFetchAndApplyLyrics(track);
+    if (result.ok) {
+      showToast(result.isSynced ? '✓ Lirik sinkron ditemukan & disimpan!' : '✓ Lirik ditemukan & disimpan', 2500, 'success');
+    } else {
+      showToast('✗ ' + result.error + '. Coba edit manual.', 3000, 'error');
+    }
+  } catch (e) {
+    showToast('✗ Error: ' + e.message, 3000, 'error');
   }
 }
 
@@ -799,8 +966,18 @@ async function init() {
     dbGetAll(STORE_PLAYLISTS),
     dbGet(STORE_META, 'recentlyPlayed'),
   ]);
+  // Migrasi: tambahin field baru ke track lama yang belum punya
+  const migrated = (tracks || []).map(t => {
+    let needsSave = false;
+    if (t.playCount === undefined) { t.playCount = 0; needsSave = true; }
+    if (t.lastPlayedAt === undefined) { t.lastPlayedAt = null; needsSave = true; }
+    if (t.lyrics === undefined) { t.lyrics = null; needsSave = true; }
+    if (t.lyricsSynced === undefined) { t.lyricsSynced = null; needsSave = true; }
+    if (needsSave) { try { dbPut(STORE_TRACKS, t); } catch(e){} }
+    return t;
+  });
   setState({
-    tracks: tracks || [],
+    tracks: migrated,
     playlists: playlists || [],
     recentlyPlayed: (recent && recent.value) || [],
   });
@@ -850,6 +1027,40 @@ function el(tag, cls, text) {
   return e;
 }
 
+// ----- Sheet close with animation -----
+// Pakai untuk semua sheet supaya ditutupnya smooth (slide-down + fade-out backdrop),
+// bukan langsung hilang yang bikin "loncat".
+//
+// Cara pakai:
+//   closeSheetWithAnim(overlayElement, sheetElement, () => setState({ queueSheetOpen: false }));
+//
+// Ini akan:
+// 1. Animate sheet slide-down + backdrop fade-out
+// 2. Setelah 240ms (animasi selesai), call callback (setState yang remove dari DOM)
+let _closingSheets = new WeakSet();
+function closeSheetWithAnim(overlay, sheet, doneCallback, isFullPlayer = false) {
+  if (_closingSheets.has(overlay)) return; // Prevent double-trigger
+  _closingSheets.add(overlay);
+
+  // Animasi keluar — pastikan slide-up tidak konflik
+  if (sheet) {
+    // Force reflow setelah remove animate-slide-up supaya slide-down bisa fresh start
+    sheet.classList.remove('animate-slide-up');
+    // Trigger reflow
+    void sheet.offsetWidth;
+    sheet.classList.add(isFullPlayer ? 'closing-fullplayer' : 'closing-sheet');
+  }
+  // Backdrop fade-out (kalau ada)
+  const backdrop = overlay.querySelector('.sheet-backdrop-bg');
+  if (backdrop) backdrop.classList.add('closing-backdrop');
+  // Disable pointer events biar nggak ada double-tap saat close
+  overlay.style.pointerEvents = 'none';
+
+  setTimeout(() => {
+    if (typeof doneCallback === 'function') doneCallback();
+  }, isFullPlayer ? 270 : 230);
+}
+
 // ----- Views -----
 function renderView() {
   switch (state.view) {
@@ -873,13 +1084,30 @@ function renderHomeView() {
   header.appendChild(greeting);
   wrap.appendChild(header);
 
-  // Recently played grid
+  // Empty state — kalau belum ada lagu sama sekali
+  if (state.tracks.length === 0) {
+    const empty = el('div', 'text-center py-12');
+    empty.innerHTML = `
+      <div class="text-6xl mb-4">🎵</div>
+      <h2 class="text-xl font-bold mb-2">Selamat datang di Sonara</h2>
+      <p class="text-spo-textMuted mb-6">Mulai dengan import lagu favoritmu</p>
+    `;
+    const btn = el('button', 'px-8 py-3 bg-spo-green hover:bg-spo-greenHover text-black font-bold rounded-full transition');
+    btn.textContent = 'Import lagu';
+    btn.onclick = () => setState({ importDialogOpen: true });
+    empty.appendChild(btn);
+    wrap.appendChild(empty);
+    return wrap;
+  }
+
+  // === Section 1: Putar lagi (recently played, 6 cards) ===
   if (state.recentlyPlayed.length > 0) {
     const recents = state.recentlyPlayed
       .map(id => state.tracks.find(t => t.id === id))
       .filter(Boolean)
       .slice(0, 6);
     if (recents.length > 0) {
+      wrap.appendChild(el('h2', 'text-xl font-bold mb-3', 'Putar lagi'));
       const grid = el('div', 'grid grid-cols-2 gap-2 mb-6');
       recents.forEach(t => {
         const card = el('button', 'flex items-center gap-3 bg-white/10 hover:bg-white/20 rounded-md overflow-hidden text-left transition');
@@ -891,23 +1119,88 @@ function renderHomeView() {
         card.appendChild(title);
         card.onclick = () => {
           const idx = state.tracks.findIndex(x => x.id === t.id);
-          playFromList(state.tracks, idx, { type: 'library', name: 'Sering diputar' });
+          playFromList(state.tracks, idx, { type: 'library', name: 'Putar lagi' });
         };
         grid.appendChild(card);
       });
-      wrap.appendChild(el('h2', 'text-xl font-bold mb-3', 'Sering kamu putar'));
       wrap.appendChild(grid);
     }
   }
 
-  // Playlists
+  // === Section 2: Top tracks bulan ini (paling sering diputar) ===
+  const topTracks = state.tracks
+    .filter(t => (t.playCount || 0) > 0)
+    .sort((a, b) => (b.playCount || 0) - (a.playCount || 0))
+    .slice(0, 10);
+  if (topTracks.length >= 3) {
+    wrap.appendChild(el('h2', 'text-xl font-bold mb-3 mt-2', 'Sering kamu putar'));
+    const row = el('div', 'flex gap-3 overflow-x-auto scroll-y -mx-4 px-4 pb-2 mb-6');
+    topTracks.forEach((t, i) => {
+      const card = el('button', 'flex-shrink-0 w-32 text-left');
+      const cov = el('div', 'w-32 h-32 bg-spo-elevated rounded mb-2 cover-shadow relative');
+      const cu = coverUrl(t);
+      if (cu) cov.style.backgroundImage = `url(${cu})`, cov.style.backgroundSize = 'cover', cov.style.backgroundPosition = 'center';
+      // Badge ranking di top tracks (1, 2, 3, dst)
+      if (i < 3) {
+        const badge = el('div', 'absolute top-1 left-1 bg-spo-green text-black text-xs font-bold px-1.5 py-0.5 rounded');
+        badge.textContent = `#${i+1}`;
+        cov.appendChild(badge);
+      }
+      card.appendChild(cov);
+      card.appendChild(el('div', 'text-sm font-semibold truncate', t.title));
+      card.appendChild(el('div', 'text-xs text-spo-textMuted truncate', `${t.playCount}× • ${t.artist}`));
+      card.onclick = () => {
+        const idx = state.tracks.findIndex(x => x.id === t.id);
+        playFromList(state.tracks, idx, { type: 'library', name: 'Sering diputar' });
+      };
+      row.appendChild(card);
+    });
+    wrap.appendChild(row);
+  }
+
+  // === Section 3: Smart Playlists (auto) ===
+  const smartPlaylists = getSmartPlaylists();
+  if (smartPlaylists.length > 0) {
+    wrap.appendChild(el('h2', 'text-xl font-bold mb-3 mt-2', 'Dibuat untukmu'));
+    const grid = el('div', 'grid grid-cols-2 gap-3 mb-6');
+    smartPlaylists.forEach(sp => {
+      const card = el('button', 'text-left hover:bg-white/5 rounded-lg p-2 transition');
+      const cov = el('div', 'w-full aspect-square rounded mb-2 cover-shadow flex items-center justify-center relative overflow-hidden');
+      cov.style.background = sp.gradient;
+      // Pakai cover lagu pertama kalau ada
+      const firstTrack = sp.tracks[0];
+      if (firstTrack) {
+        const cu = coverUrl(firstTrack);
+        if (cu) {
+          cov.style.backgroundImage = `url(${cu})`;
+          cov.style.backgroundSize = 'cover';
+          cov.style.backgroundPosition = 'center';
+          // Tambahin overlay gelap supaya teks badge keliatan
+          const dim = el('div', 'absolute inset-0 bg-black/40');
+          cov.appendChild(dim);
+        }
+      }
+      // Badge label
+      const badge = el('div', 'absolute bottom-2 left-2 right-2 text-white font-bold text-base z-10 leading-tight');
+      badge.textContent = sp.name;
+      cov.appendChild(badge);
+      card.appendChild(cov);
+      card.appendChild(el('div', 'text-xs text-spo-textMuted', `${sp.tracks.length} lagu`));
+      card.onclick = () => {
+        playFromList(sp.tracks, 0, { type: 'smart', name: sp.name });
+      };
+      grid.appendChild(card);
+    });
+    wrap.appendChild(grid);
+  }
+
+  // === Section 4: Playlist kamu ===
   if (state.playlists.length > 0) {
     wrap.appendChild(el('h2', 'text-xl font-bold mb-3 mt-2', 'Playlist kamu'));
     const list = el('div', 'flex flex-col gap-2');
     state.playlists.forEach(pl => {
       const item = el('button', 'flex items-center gap-3 hover:bg-white/5 rounded-md p-2 -mx-2 transition text-left');
       const cov = el('div', 'w-14 h-14 bg-gradient-to-br from-spo-green to-emerald-700 rounded flex items-center justify-center flex-shrink-0');
-      // Pakai cover lagu pertama playlist kalau ada
       const firstTrack = pl.trackIds.map(id => state.tracks.find(t => t.id === id)).find(Boolean);
       if (firstTrack) {
         const cu = coverUrl(firstTrack);
@@ -934,22 +1227,81 @@ function renderHomeView() {
     wrap.appendChild(list);
   }
 
-  // Empty state
-  if (state.tracks.length === 0) {
-    const empty = el('div', 'text-center py-12');
-    empty.innerHTML = `
-      <div class="text-6xl mb-4">🎵</div>
-      <h2 class="text-xl font-bold mb-2">Selamat datang di Sonara</h2>
-      <p class="text-spo-textMuted mb-6">Mulai dengan import lagu favoritmu</p>
-    `;
-    const btn = el('button', 'px-8 py-3 bg-spo-green hover:bg-spo-greenHover text-black font-bold rounded-full transition');
-    btn.textContent = 'Import lagu';
-    btn.onclick = () => setState({ importDialogOpen: true });
-    empty.appendChild(btn);
-    wrap.appendChild(empty);
+  return wrap;
+}
+
+// ----- Smart Playlists (auto) -----
+function getSmartPlaylists() {
+  const result = [];
+  const allTracks = state.tracks;
+  if (allTracks.length === 0) return result;
+
+  // 1. Disukai (kalau ada > 3)
+  const liked = allTracks.filter(t => t.liked);
+  if (liked.length >= 3) {
+    result.push({
+      id: 'smart-liked',
+      name: 'Lagu Disukai',
+      tracks: liked.sort((a, b) => (b.lastPlayedAt || b.addedAt) - (a.lastPlayedAt || a.addedAt)),
+      gradient: 'linear-gradient(135deg, #c026d3 0%, #1e3a8a 100%)',
+    });
   }
 
-  return wrap;
+  // 2. Baru ditambahkan (last 30 days, max 30 lagu)
+  const month = 30 * 24 * 60 * 60 * 1000;
+  const recentlyAdded = allTracks
+    .filter(t => (t.addedAt || 0) > Date.now() - month)
+    .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0))
+    .slice(0, 30);
+  if (recentlyAdded.length >= 3) {
+    result.push({
+      id: 'smart-new',
+      name: 'Baru ditambahkan',
+      tracks: recentlyAdded,
+      gradient: 'linear-gradient(135deg, #059669 0%, #047857 100%)',
+    });
+  }
+
+  // 3. Belum pernah didengar (playCount = 0 dan bukan baru ditambahkan)
+  const undiscovered = allTracks
+    .filter(t => (t.playCount || 0) === 0 && (t.addedAt || 0) < Date.now() - month)
+    .sort(() => Math.random() - 0.5)
+    .slice(0, 30);
+  if (undiscovered.length >= 5) {
+    result.push({
+      id: 'smart-discover',
+      name: 'Discover Mix',
+      tracks: undiscovered,
+      gradient: 'linear-gradient(135deg, #7c3aed 0%, #db2777 100%)',
+    });
+  }
+
+  // 4. Sering didengar (playCount >= 5)
+  const often = allTracks
+    .filter(t => (t.playCount || 0) >= 5)
+    .sort((a, b) => (b.playCount || 0) - (a.playCount || 0))
+    .slice(0, 50);
+  if (often.length >= 3) {
+    result.push({
+      id: 'smart-often',
+      name: 'Favorit Mix',
+      tracks: often,
+      gradient: 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)',
+    });
+  }
+
+  // 5. Random shuffle (50 lagu acak) — selalu ada kalau library > 10
+  if (allTracks.length >= 10) {
+    const shuffled = [...allTracks].sort(() => Math.random() - 0.5).slice(0, 50);
+    result.push({
+      id: 'smart-random',
+      name: 'Random Mix',
+      tracks: shuffled,
+      gradient: 'linear-gradient(135deg, #0891b2 0%, #0e7490 100%)',
+    });
+  }
+
+  return result;
 }
 
 function getGreeting() {
@@ -1695,6 +2047,8 @@ function renderFullPlayer() {
   if (!t) return el('div');
   // FIX: tambahkan bg-spo-bg dasar + touch-none di luar elemen interaktif
   const overlay = el('div', 'fixed inset-0 z-40 animate-slide-up overflow-hidden bg-spo-bg');
+  // Helper close-with-animation untuk full player
+  const closeFull = () => closeSheetWithAnim(overlay, overlay, () => setState({ fullPlayerOpen: false }), true);
   // Stop tap dari nembus ke layer di belakang
   overlay.addEventListener('pointerdown', (e) => e.stopPropagation());
   // Blurred cover background
@@ -1721,7 +2075,7 @@ function renderFullPlayer() {
   const top = el('div', 'flex items-center px-3 py-3');
   const down = el('button', 'p-2');
   down.innerHTML = svgIcon('chevron-down', 24);
-  down.onclick = () => setState({ fullPlayerOpen: false });
+  down.onclick = closeFull;
   top.appendChild(down);
   const titleC = el('div', 'flex-1 text-center');
   titleC.appendChild(el('div', 'text-[10px] tracking-wider text-white/70 uppercase', state.queueContext ? `Memainkan dari ${labelContextType(state.queueContext.type)}` : 'Memainkan'));
@@ -1733,8 +2087,92 @@ function renderFullPlayer() {
   top.appendChild(more);
   content.appendChild(top);
 
-  // Spacer + cover di tengah (besar)
-  content.appendChild(el('div', 'flex-1'));
+  // Spacer + cover di tengah (besar) — ATAU panel lirik kalau toggled
+
+  // Container yang flex-1 — bisa swap antara kosong (cover dari blurred bg) atau lyrics panel
+  const middle = el('div', 'flex-1 relative overflow-hidden');
+  content.appendChild(middle);
+
+  // Lyrics panel (hidden by default)
+  const lyricsPanel = el('div', 'absolute inset-0 px-6 pb-4 overflow-y-auto scroll-y opacity-0 pointer-events-none transition-opacity duration-300');
+  lyricsPanel.style.maxHeight = '100%';
+  middle.appendChild(lyricsPanel);
+
+  // Toggle attached ke top bar (kanan, di samping tombol more)
+  // Pasang di top bar, sebelah kiri tombol more
+  if (t.lyrics || t.lyricsSynced) {
+    const lyricBtn = el('button', 'mr-1 px-3 py-1 rounded-full bg-white/15 text-xs font-semibold');
+    lyricBtn.textContent = 'LIRIK';
+    let lyricsShown = false;
+    lyricBtn.onclick = () => {
+      lyricsShown = !lyricsShown;
+      if (lyricsShown) {
+        // Build lirik content
+        lyricsPanel.innerHTML = '';
+        if (t.lyricsSynced && t.lyricsSynced.length > 0) {
+          // Synced: tiap baris jadi div dengan timestamp
+          t.lyricsSynced.forEach((ln, idx) => {
+            const lineEl = el('div', 'py-2 text-lg font-semibold leading-snug text-white/40 transition-colors duration-200 cursor-pointer');
+            lineEl.dataset.lyrIdx = String(idx);
+            lineEl.dataset.lyrTime = String(ln.time);
+            lineEl.textContent = ln.text;
+            lineEl.onclick = () => { audio.currentTime = ln.time; };
+            lyricsPanel.appendChild(lineEl);
+          });
+          // Padding atas/bawah biar baris aktif bisa di-scroll ke tengah
+          lyricsPanel.style.paddingTop = '40%';
+          lyricsPanel.style.paddingBottom = '40%';
+        } else {
+          // Plain text
+          const pre = el('pre', 'whitespace-pre-wrap text-white/85 text-base leading-relaxed font-sans');
+          pre.textContent = t.lyrics;
+          lyricsPanel.appendChild(pre);
+        }
+        lyricsPanel.classList.remove('opacity-0', 'pointer-events-none');
+        lyricBtn.classList.add('bg-spo-green', 'text-black');
+        lyricBtn.classList.remove('bg-white/15');
+      } else {
+        lyricsPanel.classList.add('opacity-0', 'pointer-events-none');
+        lyricBtn.classList.remove('bg-spo-green', 'text-black');
+        lyricBtn.classList.add('bg-white/15');
+      }
+    };
+    // Insert before more button
+    top.insertBefore(lyricBtn, more);
+
+    // Auto-scroll synced lyrics — listen ke time updates
+    if (t.lyricsSynced && t.lyricsSynced.length > 0) {
+      let lastActiveIdx = -1;
+      const unsubLyrics = onTimeUpdate((cur) => {
+        if (!lyricsShown) return;
+        // Find baris aktif: baris dengan time <= cur, dan baris berikutnya time > cur
+        let activeIdx = -1;
+        for (let i = 0; i < t.lyricsSynced.length; i++) {
+          if (t.lyricsSynced[i].time <= cur) activeIdx = i;
+          else break;
+        }
+        if (activeIdx === lastActiveIdx) return;
+        lastActiveIdx = activeIdx;
+        const lines = lyricsPanel.querySelectorAll('[data-lyr-idx]');
+        lines.forEach((ln, i) => {
+          if (i === activeIdx) {
+            ln.classList.remove('text-white/40');
+            ln.classList.add('text-white', 'text-xl');
+            // Scroll ke tengah, smooth
+            ln.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          } else {
+            ln.classList.add('text-white/40');
+            ln.classList.remove('text-white', 'text-xl');
+          }
+        });
+      });
+      // Cleanup saat overlay di-unmount
+      const obs = new MutationObserver(() => {
+        if (!document.body.contains(overlay)) { unsubLyrics(); obs.disconnect(); }
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+    }
+  }
 
   // Lirik preview (kalau ada — kita skip untuk sekarang, tampilkan info)
   // Track info row
@@ -1744,7 +2182,7 @@ function renderFullPlayer() {
   const artistBtn = el('button', 'text-white/70 text-base text-left truncate w-full');
   artistBtn.textContent = t.artist;
   artistBtn.onclick = () => {
-    setState({ view: 'artist', viewParam: t.artist, fullPlayerOpen: false });
+    closeSheetWithAnim(overlay, overlay, () => setState({ view: 'artist', viewParam: t.artist, fullPlayerOpen: false }), true);
   };
   tinfo.appendChild(artistBtn);
   info.appendChild(tinfo);
@@ -1857,9 +2295,12 @@ function labelContextType(t) {
 // ----- Queue Sheet -----
 function renderQueueSheet() {
   const overlay = el('div', 'fixed inset-0 z-50 flex flex-col');
+  // Close-with-animation handler (dipake oleh tap-close, tombol X, dan backdrop)
+  const doClose = () => closeSheetWithAnim(overlay, sheet, () => setState({ queueSheetOpen: false }));
+
   // Behind: blurred cover (backdrop)
   const t = state.currentTrack;
-  const back = el('div', 'absolute inset-0');
+  const back = el('div', 'absolute inset-0 sheet-backdrop-bg');
   if (t) {
     const cu = coverUrl(t);
     if (cu) {
@@ -1878,7 +2319,7 @@ function renderQueueSheet() {
 
   // Tap-to-close area di atas
   const tapClose = el('div', 'flex-1');
-  tapClose.onclick = () => setState({ queueSheetOpen: false });
+  tapClose.onclick = doClose;
   overlay.appendChild(tapClose);
 
   // Sheet
@@ -1894,7 +2335,7 @@ function renderQueueSheet() {
   const closeBtn = el('button', 'absolute top-2 right-3 w-9 h-9 flex items-center justify-center rounded-full hover:bg-white/10 active:bg-white/20');
   closeBtn.innerHTML = svgIcon('close', 22);
   closeBtn.setAttribute('aria-label', 'Tutup');
-  closeBtn.onclick = (e) => { e.stopPropagation(); setState({ queueSheetOpen: false }); };
+  closeBtn.onclick = (e) => { e.stopPropagation(); doClose(); };
   header.appendChild(closeBtn);
   header.appendChild(el('h2', 'text-2xl font-bold pr-10', 'Antrean'));
   header.appendChild(el('div', 'text-sm', `Memutar `));
@@ -2027,10 +2468,11 @@ function escapeHtml(s) {
 // ----- Sleep Timer Sheet -----
 function renderSleepTimerSheet() {
   const overlay = el('div', 'fixed inset-0 z-[60] flex flex-col sheet-backdrop');
-  overlay.onclick = (e) => { if (e.target === overlay) setState({ sleepTimerSheetOpen: false }); };
+  const sheet = el('div', 'bg-spo-sheet rounded-t-2xl animate-slide-up safe-bottom');
+  const doClose = () => closeSheetWithAnim(overlay, sheet, () => setState({ sleepTimerSheetOpen: false }));
+  overlay.onclick = (e) => { if (e.target === overlay) doClose(); };
   overlay.appendChild(el('div', 'flex-1'));
 
-  const sheet = el('div', 'bg-spo-sheet rounded-t-2xl animate-slide-up safe-bottom');
   // Handle
   sheet.appendChild(el('div', 'flex justify-center pt-2 pb-2',));
   sheet.lastChild.innerHTML = '<div class="w-10 h-1 bg-white/40 rounded-full"></div>';
@@ -2040,7 +2482,7 @@ function renderSleepTimerSheet() {
   const closeSlp = el('button', 'absolute top-1/2 right-3 -translate-y-1/2 w-9 h-9 flex items-center justify-center rounded-full hover:bg-white/10 active:bg-white/20');
   closeSlp.innerHTML = svgIcon('close', 20);
   closeSlp.setAttribute('aria-label', 'Tutup');
-  closeSlp.onclick = (e) => { e.stopPropagation(); setState({ sleepTimerSheetOpen: false }); };
+  closeSlp.onclick = (e) => { e.stopPropagation(); doClose(); };
   titleRow.appendChild(closeSlp);
   sheet.appendChild(titleRow);
 
@@ -2063,7 +2505,7 @@ function renderSleepTimerSheet() {
     b.onclick = () => {
       if (o.val === 'off') clearSleepTimer();
       else setSleepTimer(o.val);
-      setState({ sleepTimerSheetOpen: false });
+      doClose();
     };
     sheet.appendChild(b);
   });
@@ -2076,10 +2518,14 @@ function renderSleepTimerSheet() {
 function renderContextMenu() {
   const t = state.contextMenuTrack;
   const overlay = el('div', 'fixed inset-0 z-[55] flex flex-col sheet-backdrop');
-  overlay.onclick = (e) => { if (e.target === overlay) setState({ contextMenuTrack: null }); };
+  const sheet = el('div', 'bg-spo-sheet rounded-t-2xl animate-slide-up safe-bottom max-h-[80vh] overflow-y-auto scroll-y');
+  const doClose = (then) => closeSheetWithAnim(overlay, sheet, () => {
+    setState({ contextMenuTrack: null });
+    if (typeof then === 'function') setTimeout(then, 30);
+  });
+  overlay.onclick = (e) => { if (e.target === overlay) doClose(); };
   overlay.appendChild(el('div', 'flex-1'));
 
-  const sheet = el('div', 'bg-spo-sheet rounded-t-2xl animate-slide-up safe-bottom max-h-[80vh] overflow-y-auto scroll-y');
   sheet.appendChild(el('div', 'flex justify-center pt-2 pb-2',));
   sheet.lastChild.innerHTML = '<div class="w-10 h-1 bg-white/40 rounded-full"></div>';
 
@@ -2097,25 +2543,27 @@ function renderContextMenu() {
   const closeCtx = el('button', 'flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-full hover:bg-white/10 active:bg-white/20');
   closeCtx.innerHTML = svgIcon('close', 20);
   closeCtx.setAttribute('aria-label', 'Tutup');
-  closeCtx.onclick = (e) => { e.stopPropagation(); setState({ contextMenuTrack: null }); };
+  closeCtx.onclick = (e) => { e.stopPropagation(); doClose(); };
   head.appendChild(closeCtx);
   sheet.appendChild(head);
 
   const items = [
-    { icon: t.liked ? 'heart-filled' : 'heart', label: t.liked ? 'Hapus dari Disukai' : 'Tambah ke Disukai', onClick: () => { toggleLike(t.id); setState({ contextMenuTrack: null }); } },
-    { icon: 'plus-circle', label: 'Tambahkan ke playlist', onClick: () => showAddToPlaylistMenu(t) },
-    { icon: 'queue', label: 'Tambahkan ke Antrean', onClick: () => { addToQueue(t.id); setState({ contextMenuTrack: null }); } },
-    { icon: 'album', label: 'Buka album', onClick: () => setState({ view: 'album', viewParam: t.album, contextMenuTrack: null, fullPlayerOpen: false }) },
-    { icon: 'artist', label: 'Buka artis', onClick: () => setState({ view: 'artist', viewParam: t.artist, contextMenuTrack: null, fullPlayerOpen: false }) },
+    { icon: t.liked ? 'heart-filled' : 'heart', label: t.liked ? 'Hapus dari Disukai' : 'Tambah ke Disukai', onClick: () => { toggleLike(t.id); doClose(); } },
+    { icon: 'plus-circle', label: 'Tambahkan ke playlist', onClick: () => doClose(() => showAddToPlaylistMenu(t)) },
+    { icon: 'queue', label: 'Tambahkan ke Antrean', onClick: () => { addToQueue(t.id); doClose(); } },
+    { icon: 'pencil', label: t.lyrics ? 'Edit lirik' : 'Tambah lirik', onClick: () => doClose(() => openLyricsEditor(t)) },
+    { icon: 'search', label: 'Cari lirik otomatis', onClick: () => doClose(() => quickFetchLyrics(t)) },
+    { icon: 'album', label: 'Buka album', onClick: () => doClose(() => setState({ view: 'album', viewParam: t.album, fullPlayerOpen: false })) },
+    { icon: 'artist', label: 'Buka artis', onClick: () => doClose(() => setState({ view: 'artist', viewParam: t.artist, fullPlayerOpen: false })) },
   ];
   // Hapus dari playlist (kalau context = playlist)
   if (t._ctx?.type === 'playlist' && t._ctx?.id) {
-    items.push({ icon: 'minus-circle', label: 'Hapus dari playlist ini', onClick: () => { removeFromPlaylist(t._ctx.id, t.id); setState({ contextMenuTrack: null }); } });
+    items.push({ icon: 'minus-circle', label: 'Hapus dari playlist ini', onClick: () => { removeFromPlaylist(t._ctx.id, t.id); doClose(); } });
   }
   items.push({ icon: 'trash', label: 'Hapus dari koleksi', onClick: () => {
     if (confirm(`Hapus "${t.title}" dari koleksi?`)) {
       deleteTrack(t.id);
-      setState({ contextMenuTrack: null });
+      doClose();
     }
   }, danger: true });
 
@@ -2159,6 +2607,75 @@ function showAddToPlaylistMenu(track) {
   });
   dialog.appendChild(sheet);
   document.body.appendChild(dialog);
+}
+
+// ----- Lyrics Editor -----
+function openLyricsEditor(track) {
+  const dialog = el('div', 'fixed inset-0 z-[70] flex flex-col bg-spo-bg safe-top safe-bottom');
+  // Top bar
+  const top = el('div', 'flex items-center p-3 border-b border-white/10 flex-shrink-0');
+  const close = el('button', 'p-2');
+  close.innerHTML = svgIcon('close', 22);
+  close.onclick = () => dialog.remove();
+  top.appendChild(close);
+  top.appendChild(el('div', 'flex-1 text-center font-bold truncate px-2', `Lirik — ${track.title}`));
+  const save = el('button', 'px-4 py-1.5 bg-spo-green text-black font-bold rounded-full text-sm');
+  save.textContent = 'Simpan';
+  top.appendChild(save);
+  dialog.appendChild(top);
+
+  // Tip
+  const tip = el('div', 'px-4 py-2 bg-white/5 text-xs text-spo-textMuted flex-shrink-0');
+  tip.innerHTML = 'Paste lirik plain text, atau format LRC (<code>[mm:ss.xx]Lirik</code>) untuk auto-sync mengikuti lagu.';
+  dialog.appendChild(tip);
+
+  // Auto-fetch button (LRCLIB)
+  const fetchRow = el('div', 'px-4 py-2 flex items-center gap-2 border-b border-white/10 flex-shrink-0');
+  const fetchBtn = el('button', 'flex-1 flex items-center justify-center gap-2 py-2 bg-spo-elevated hover:bg-white/15 rounded-md text-sm font-semibold transition');
+  fetchBtn.innerHTML = svgIcon('search', 16) + '<span>Cari otomatis (LRCLIB)</span>';
+  const fetchStatus = el('div', 'text-xs text-spo-textMuted');
+  fetchBtn.onclick = async () => {
+    fetchBtn.disabled = true;
+    fetchBtn.innerHTML = '<span class="animate-pulse">Mencari di LRCLIB...</span>';
+    fetchStatus.textContent = '';
+    try {
+      const result = await fetchLyricsFromLrclib(track);
+      if (result.ok) {
+        ta.value = result.text;
+        fetchStatus.textContent = result.isSynced ? '✓ Lirik sinkron ditemukan!' : '✓ Lirik plain ditemukan';
+        fetchStatus.className = 'text-xs text-spo-green';
+      } else {
+        fetchStatus.textContent = '✗ ' + result.error;
+        fetchStatus.className = 'text-xs text-red-400';
+      }
+    } catch (e) {
+      fetchStatus.textContent = '✗ Error: ' + e.message;
+      fetchStatus.className = 'text-xs text-red-400';
+    }
+    fetchBtn.disabled = false;
+    fetchBtn.innerHTML = svgIcon('search', 16) + '<span>Cari lagi</span>';
+  };
+  fetchRow.appendChild(fetchBtn);
+  dialog.appendChild(fetchRow);
+  const statusRow = el('div', 'px-4 pb-1 flex-shrink-0');
+  statusRow.appendChild(fetchStatus);
+  dialog.appendChild(statusRow);
+
+  // Textarea
+  const ta = el('textarea', 'flex-1 w-full bg-transparent text-white p-4 outline-none resize-none font-mono text-sm');
+  ta.placeholder = 'Paste lirik di sini...\n\nContoh format LRC (auto-sync):\n[00:12.00]Baris pertama lirik\n[00:18.50]Baris kedua\n[00:25.00]dst\n\nAtau klik tombol "Cari otomatis" di atas untuk fetch dari LRCLIB.';
+  ta.value = track.lyrics || '';
+  dialog.appendChild(ta);
+
+  save.onclick = async () => {
+    save.disabled = true;
+    save.textContent = '...';
+    await setTrackLyrics(track.id, ta.value);
+    dialog.remove();
+  };
+
+  document.body.appendChild(dialog);
+  setTimeout(() => ta.focus(), 100);
 }
 
 function renderAddTrackToPlaylistDialog(playlist) {
@@ -2208,12 +2725,12 @@ function renderImportDialog() {
   overlay.onclick = (e) => { if (e.target === overlay) setState({ importDialogOpen: false }); };
   const dialog = el('div', 'bg-spo-sheet rounded-2xl p-6 w-full max-w-md');
   dialog.appendChild(el('h3', 'text-xl font-bold mb-2', 'Import lagu'));
-  dialog.appendChild(el('p', 'text-sm text-spo-textMuted mb-4', 'Pilih file MP3, M4A, FLAC, WAV, atau OGG dari HP-mu'));
+  dialog.appendChild(el('p', 'text-sm text-spo-textMuted mb-4', 'Pilih file MP3, M4A, FLAC, WAV, atau OGG. Tambah file .lrc/.txt dengan nama yang sama untuk lirik.'));
 
   const drop = el('div', 'border-2 border-dashed border-white/20 rounded-lg p-8 text-center cursor-pointer hover:border-spo-green transition');
   drop.innerHTML = `<div class="text-4xl mb-2">📁</div><div class="font-semibold">Tap untuk pilih file</div><div class="text-xs text-spo-textMuted mt-1">atau drag & drop di sini</div>`;
   const input = el('input', 'hidden');
-  input.type = 'file'; input.multiple = true; input.accept = 'audio/*,.mp3,.m4a,.flac,.wav,.ogg,.aac';
+  input.type = 'file'; input.multiple = true; input.accept = 'audio/*,.mp3,.m4a,.flac,.wav,.ogg,.aac,.lrc,.txt';
   drop.onclick = () => input.click();
   input.onchange = async (e) => {
     drop.innerHTML = '<div class="text-spo-green">Mengimpor...</div>';
@@ -2335,24 +2852,98 @@ function syncHistory() {
   _lastHistoryDepth = depth;
 }
 
+// ----- Toast notification (untuk pesan singkat seperti "Tekan kembali sekali lagi") -----
+let _toastEl = null;
+let _toastTimer = null;
+function showToast(message, duration = 2000, type = 'default') {
+  if (_toastTimer) clearTimeout(_toastTimer);
+  if (_toastEl) _toastEl.remove();
+  let cls = 'fixed bottom-24 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-sm z-[200] animate-fade-in pointer-events-none shadow-lg ';
+  if (type === 'success') cls += 'bg-spo-green text-black font-semibold';
+  else if (type === 'error') cls += 'bg-red-600 text-white font-semibold';
+  else cls += 'bg-black/90 text-white';
+  _toastEl = el('div', cls);
+  _toastEl.style.maxWidth = '90%';
+  // Multi-line allowed untuk pesan panjang
+  _toastEl.style.whiteSpace = 'normal';
+  _toastEl.style.textAlign = 'center';
+  _toastEl.textContent = message;
+  document.body.appendChild(_toastEl);
+  _toastTimer = setTimeout(() => {
+    if (_toastEl) {
+      _toastEl.style.transition = 'opacity 250ms';
+      _toastEl.style.opacity = '0';
+      setTimeout(() => { _toastEl?.remove(); _toastEl = null; }, 260);
+    }
+  }, duration);
+}
+
+let _backTapAt = 0;
 window.addEventListener('popstate', (e) => {
   // Tombol kembali ditekan. Tutup overlay paling atas.
   const depth = getOverlayDepth();
   if (depth === 0) {
-    // Tidak ada overlay — biarin browser handle (keluar app / kembali web history)
+    // Tidak ada overlay terbuka — kita di tab utama (Home/Cari/Koleksi)
+    //
+    // Smart navigation:
+    // 1. Kalau lagi di Cari atau Koleksi → balik ke Home dulu (kayak Spotify/IG)
+    // 2. Kalau udah di Home → toast "tekan lagi untuk keluar"
+    // 3. Tap kedua dalam 2 detik → benar-benar keluar app
+    //    (TAPI kasih warning kalau lagi play music)
+    if (state.view === 'search' || state.view === 'library') {
+      // Pindah ke Home dulu, push sentinel baru supaya next-back trigger handler ini lagi
+      setState({ view: 'home', viewParam: null });
+      history.pushState({ sonara: true, depth: 0, sentinel: true }, '');
+      _lastHistoryDepth = 0;
+      _backTapAt = 0; // reset
+      return;
+    }
+
+    // Sudah di Home — handle exit dengan double-tap
+    const now = Date.now();
+    if (now - _backTapAt < 2000) {
+      // Tap kedua — keluar app
+      // Tip ke user: kalau lagi play music, lebih baik tekan tombol Home (rumah)
+      // supaya musik tetep jalan di background. Tapi kalau user maksa back, kita tetep keluar.
+      _lastHistoryDepth = 0;
+      return;
+    }
+    // Tap pertama: tahan supaya nggak keluar app
+    _backTapAt = now;
+    // Pesan beda kalau lagi play music — edukasi user
+    if (!audio.paused) {
+      showToast('💡 Tekan tombol Home supaya musik tetap jalan, atau tekan kembali sekali lagi untuk keluar', 2800);
+    } else {
+      showToast('Tekan kembali sekali lagi untuk keluar', 2000);
+    }
+    // Push state baru supaya tap kembali berikutnya trigger popstate lagi (bukan keluar)
+    history.pushState({ sonara: true, depth: 0, sentinel: true }, '');
     _lastHistoryDepth = 0;
     return;
   }
   _historySyncing = true;
+
+  // Helper: cari overlay aktif yang sedang muncul, animate keluar, lalu setState
+  const animateAndClose = (selector, sheetSelector, stateUpdate, isFullPlayer = false) => {
+    const overlay = document.querySelector(selector);
+    const sheet = sheetSelector ? overlay?.querySelector(sheetSelector) : overlay;
+    if (overlay && sheet) {
+      closeSheetWithAnim(overlay, sheet, () => setState(stateUpdate), isFullPlayer);
+    } else {
+      // Fallback: langsung setState kalau elemen nggak ketemu
+      setState(stateUpdate);
+    }
+  };
+
   // Tutup yang paling depan (urutan prioritas)
   if (state.contextMenuTrack) {
-    setState({ contextMenuTrack: null });
+    animateAndClose('.fixed.inset-0.z-\\[55\\]', '.bg-spo-sheet', { contextMenuTrack: null });
   } else if (state.sleepTimerSheetOpen) {
-    setState({ sleepTimerSheetOpen: false });
+    animateAndClose('.fixed.inset-0.z-\\[60\\]', '.bg-spo-sheet', { sleepTimerSheetOpen: false });
   } else if (state.queueSheetOpen) {
-    setState({ queueSheetOpen: false });
+    animateAndClose('.fixed.inset-0.z-50', '.bg-spo-surface', { queueSheetOpen: false });
   } else if (state.fullPlayerOpen) {
-    setState({ fullPlayerOpen: false });
+    animateAndClose('.fixed.inset-0.z-40', null, { fullPlayerOpen: false }, true);
   } else {
     const mainTabs = ['home', 'search', 'library'];
     if (state.view && !mainTabs.includes(state.view)) {
@@ -2360,16 +2951,20 @@ window.addEventListener('popstate', (e) => {
       setState({ view: 'library', viewParam: null });
     }
   }
+
   _historySyncing = false;
-  _lastHistoryDepth = getOverlayDepth();
+  // Update depth setelah animasi selesai (animasi take 240ms, kita pakai 280ms untuk safety)
+  setTimeout(() => { _lastHistoryDepth = getOverlayDepth(); }, 300);
 });
 
 // Subscribe sync history setiap state berubah
 subscribe(() => syncHistory());
 
-// Init: push 1 sentinel state supaya popstate pertama nggak langsung keluar app
-// (kalau user tekan back saat di main tab, history.back() akan trigger ini, bukan keluar)
+// Init: replace state pertama jadi sentinel, lalu push 1 sentinel TAMBAHAN
+// supaya popstate pertama (saat user tekan back di tab utama) trigger handler kita
+// — bukan langsung keluar app. Ini bagian dari trick "tekan kembali sekali lagi untuk keluar".
 history.replaceState({ sonara: true, depth: 0, root: true }, '');
+history.pushState({ sonara: true, depth: 0, sentinel: true }, '');
 
 // Service worker — dengan auto-update saat ada versi baru
 if ('serviceWorker' in navigator) {
