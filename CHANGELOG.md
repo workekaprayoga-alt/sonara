@@ -1,5 +1,27 @@
 # Sonara Changelog
 
+## v13.1 — Fix daftar Artis terpotong (Mei 2026)
+
+### 🐛 Bug fix utama
+
+- **Daftar Artis & Album di tab Cari sebelumnya terpotong di 10 doang.** Akibatnya kalau punya 89 lagu dari 25 artis, cuma 10 yang keliatan, sisanya seperti "hilang". Sekarang **semua artis & album ditampilkan**, di-sort dari yang punya lagu terbanyak. Header juga nampakkan jumlah total ("25 artis", "18 album").
+
+### 🆕 Editor info lagu
+
+- **Edit info lagu** — item baru di context menu lagu (⋯). Bisa edit judul, artis, album, tahun rilis, komposer, penulis lirik. Berguna untuk file MP3 yang tag-nya tidak lengkap atau salah.
+- Override disimpan di Sonara — file MP3 asli tidak diubah.
+- Setelah simpan, scroll cache di-clear supaya daftar Artis/Album yang baru langsung kelihatan rapi.
+
+### 💡 Tip baru di Koleksi
+
+- Kalau ada ≥3 lagu dengan artist "Unknown Artist", muncul tip kuning yang jelasin: file MP3 ini tidak punya tag artis, makanya tidak muncul di daftar Artis. Arahan ke ⋯ → Edit info lagu untuk isi manual.
+
+### Deploy
+
+Upload **index.html** + **sw.js** → SW v19 auto-update.
+
+---
+
 ## v13 — Polish Release (Mei 2026)
 
 ### 🐛 Bug fix

@@ -2785,19 +2785,41 @@ function renderSearchView() {
     resultsBox.innerHTML = '';
     if (!_searchQuery) {
       // Browse: artists & albums
-      const artists = [...new Set(state.tracks.map(t => t.artist).filter(a => a && a !== 'Unknown Artist'))];
-      const albums = [...new Set(state.tracks.map(t => t.album).filter(a => a && a !== 'Unknown Album'))];
+      // Hitung jumlah lagu per artis & album supaya bisa di-sort by popularity
+      const artistCount = new Map();
+      const albumCount = new Map();
+      state.tracks.forEach(t => {
+        if (t.artist && t.artist !== 'Unknown Artist') {
+          artistCount.set(t.artist, (artistCount.get(t.artist) || 0) + 1);
+        }
+        if (t.album && t.album !== 'Unknown Album') {
+          albumCount.set(t.album, (albumCount.get(t.album) || 0) + 1);
+        }
+      });
+      // Sort by track count desc, lalu alfabet
+      const artists = [...artistCount.keys()].sort((a, b) =>
+        (artistCount.get(b) - artistCount.get(a)) || a.localeCompare(b)
+      );
+      const albums = [...albumCount.keys()].sort((a, b) =>
+        (albumCount.get(b) - albumCount.get(a)) || a.localeCompare(b)
+      );
 
       if (artists.length > 0) {
-        resultsBox.appendChild(el('h2', 'text-lg font-bold mt-6 mb-3', 'Artis'));
+        const head = el('div', 'flex items-baseline justify-between mt-6 mb-3');
+        head.appendChild(el('h2', 'text-lg font-bold', 'Artis'));
+        head.appendChild(el('div', 'text-xs text-spo-textMuted', `${artists.length} artis`));
+        resultsBox.appendChild(head);
         const grid = el('div', 'grid grid-cols-2 gap-3');
-        artists.slice(0, 10).forEach(a => grid.appendChild(renderArtistCard(a)));
+        artists.forEach(a => grid.appendChild(renderArtistCard(a)));
         resultsBox.appendChild(grid);
       }
       if (albums.length > 0) {
-        resultsBox.appendChild(el('h2', 'text-lg font-bold mt-6 mb-3', 'Album'));
+        const head = el('div', 'flex items-baseline justify-between mt-6 mb-3');
+        head.appendChild(el('h2', 'text-lg font-bold', 'Album'));
+        head.appendChild(el('div', 'text-xs text-spo-textMuted', `${albums.length} album`));
+        resultsBox.appendChild(head);
         const grid = el('div', 'grid grid-cols-2 gap-3');
-        albums.slice(0, 10).forEach(a => grid.appendChild(renderAlbumCard(a)));
+        albums.forEach(a => grid.appendChild(renderAlbumCard(a)));
         resultsBox.appendChild(grid);
       }
       return;
@@ -2910,6 +2932,20 @@ function renderLibraryView() {
     btn.textContent = 'Cari semua';
     btn.onclick = bulkFetchCovers;
     tipRow.appendChild(btn);
+    wrap.appendChild(tipRow);
+  }
+
+  // Tip: kalau banyak lagu artist-nya "Unknown Artist", arahkan ke editor metadata
+  const unknownArtistCount = state.tracks.filter(t => !t.artist || t.artist === 'Unknown Artist').length;
+  if (unknownArtistCount >= 3) {
+    const tipRow = el('div', 'flex items-start gap-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg px-3 py-2.5 mb-4');
+    const ic = el('div', 'text-yellow-400 flex-shrink-0 mt-0.5');
+    ic.innerHTML = svgIcon('info', 18);
+    tipRow.appendChild(ic);
+    const content = el('div', 'flex-1 text-xs leading-snug');
+    content.appendChild(el('div', 'font-semibold text-yellow-300 mb-0.5', `${unknownArtistCount} lagu tanpa info artis`));
+    content.appendChild(el('div', 'text-white/70', 'File MP3 ini tidak punya tag artis (ID3). Itu sebabnya tidak muncul di daftar Artis di tab Cari. Tap lagu → ⋯ → "Edit info" untuk isi manual.'));
+    tipRow.appendChild(content);
     wrap.appendChild(tipRow);
   }
 
@@ -4729,6 +4765,7 @@ function renderContextMenu() {
     { icon: 'plus-circle', label: 'Tambahkan ke playlist', onClick: () => doClose(() => showAddToPlaylistMenu(t)) },
     { icon: 'queue', label: 'Tambahkan ke Antrean', onClick: () => { addToQueue(t.id); doClose(); } },
     { icon: 'pencil', label: t.lyrics ? 'Edit lirik' : 'Tambah lirik', onClick: () => doClose(() => openLyricsEditor(t)) },
+    { icon: 'edit', label: 'Edit info lagu', onClick: () => doClose(() => openTrackInfoEditor(t)) },
     { icon: 'search', label: 'Cari lirik otomatis', onClick: () => doClose(() => quickFetchLyrics(t)) },
   ];
   // Item Cari cover hanya muncul kalau lagu belum punya cover
@@ -5372,6 +5409,97 @@ function openLyricsEditor(track) {
   document.body.appendChild(dialog);
   registerDomDialog(closeDialog);
   setTimeout(() => ta.focus(), 100);
+}
+
+// ===== Track Info Editor =====
+// Edit metadata (judul, artis, album, tahun, composer, lyricist) untuk satu lagu.
+// Berguna untuk file MP3 yang tag-nya tidak lengkap. Tag asli di file tidak diubah,
+// override disimpan di IndexedDB track record.
+function openTrackInfoEditor(track) {
+  if (!track) return;
+  const dialog = el('div', 'fixed inset-0 z-[70] flex flex-col bg-spo-bg safe-top safe-bottom');
+  const closeDialog = () => { if (dialog.parentNode) dialog.remove(); unregisterDomDialog(closeDialog); };
+
+  // Top bar
+  const top = el('div', 'flex items-center p-3 border-b border-white/10 flex-shrink-0');
+  const close = el('button', 'p-2');
+  close.innerHTML = svgIcon('close', 22);
+  close.onclick = closeDialog;
+  top.appendChild(close);
+  top.appendChild(el('div', 'flex-1 text-center font-bold truncate px-2', 'Edit info lagu'));
+  const save = el('button', 'px-4 py-1.5 bg-spo-green text-black font-bold rounded-full text-sm');
+  save.textContent = 'Simpan';
+  top.appendChild(save);
+  dialog.appendChild(top);
+
+  // Tip
+  const tip = el('div', 'px-4 py-2 bg-white/5 text-xs text-spo-textMuted flex-shrink-0');
+  tip.textContent = 'Ubah info di sini hanya berlaku di Sonara. File MP3 aslinya tidak diubah. Kosongkan field untuk kembali ke nilai dari tag MP3.';
+  dialog.appendChild(tip);
+
+  // Form body
+  const body = el('div', 'flex-1 overflow-y-auto scroll-y p-4 space-y-4');
+  dialog.appendChild(body);
+
+  // Helper: render satu field
+  const fields = {};
+  const addField = (key, label, placeholder, currentValue) => {
+    const wrap = el('div', '');
+    wrap.appendChild(el('label', 'block text-xs text-spo-textMuted mb-1 uppercase tracking-wider', label));
+    const input = el('input', 'w-full bg-spo-elevated text-white px-3 py-2.5 rounded-md outline-none focus:ring-2 focus:ring-spo-green text-sm');
+    input.type = 'text';
+    input.placeholder = placeholder || '';
+    input.value = currentValue || '';
+    wrap.appendChild(input);
+    body.appendChild(wrap);
+    fields[key] = input;
+  };
+
+  addField('title', 'Judul', 'Judul lagu', track.title);
+  addField('artist', 'Artis', 'Nama artis / penyanyi', track.artist === 'Unknown Artist' ? '' : track.artist);
+  addField('album', 'Album', 'Nama album', track.album === 'Unknown Album' ? '' : track.album);
+  addField('year', 'Tahun rilis', 'cth. 2023', track.year);
+  addField('composer', 'Komposer', 'Pencipta lagu', track.composer);
+  addField('lyricist', 'Penulis lirik', 'Penulis lirik (kalau berbeda)', track.lyricist);
+
+  save.onclick = async () => {
+    save.disabled = true;
+    save.textContent = '...';
+    try {
+      const t = state.tracks.find(x => x.id === track.id);
+      if (!t) { closeDialog(); return; }
+
+      const newTitle = fields.title.value.trim();
+      const newArtist = fields.artist.value.trim();
+      const newAlbum = fields.album.value.trim();
+      const newYear = fields.year.value.trim();
+      const newComposer = fields.composer.value.trim();
+      const newLyricist = fields.lyricist.value.trim();
+
+      t.title = newTitle || track.title || 'Untitled';
+      t.artist = newArtist || 'Unknown Artist';
+      t.album = newAlbum || 'Unknown Album';
+      t.year = newYear || null;
+      t.composer = newComposer || null;
+      t.lyricist = newLyricist || null;
+
+      await dbPut(STORE_TRACKS, t);
+      // Clear scroll cache karena susunan artist/album bisa berubah
+      _scrollPositions.clear();
+      setState({ tracks: [...state.tracks] });
+      if (state.currentTrack?.id === t.id) setState({ currentTrack: t });
+      showToast('✓ Info lagu diperbarui', 1800, 'success');
+      closeDialog();
+    } catch (e) {
+      save.disabled = false;
+      save.textContent = 'Simpan';
+      showToast('Gagal menyimpan: ' + e.message, 2500, 'error');
+    }
+  };
+
+  document.body.appendChild(dialog);
+  registerDomDialog(closeDialog);
+  setTimeout(() => fields.title.focus(), 100);
 }
 
 function renderAddTrackToPlaylistDialog(playlist) {
