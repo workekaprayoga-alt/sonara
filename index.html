@@ -1420,6 +1420,12 @@ async function importFiles(fileList) {
   const audioFiles = allFiles.filter(f => f.type.startsWith('audio/') || /\.(mp3|m4a|flac|wav|ogg|aac)$/i.test(f.name));
   const lyricFiles = allFiles.filter(f => /\.(lrc|txt)$/i.test(f.name));
 
+  // Pre-flight: cek kuota storage. Kalau hampir penuh, kasih warning sebelum mulai.
+  if (audioFiles.length > 0) {
+    const proceed = await checkImportQuota(audioFiles);
+    if (!proceed) return;
+  }
+
   // Counters untuk feedback ke user
   let importedCount = 0;
   const skippedDupes = [];
@@ -2892,9 +2898,27 @@ function renderAlbumCard(album) {
 function renderLibraryView() {
   const wrap = el('div', 'p-4 pb-32');
 
-  const header = el('div', 'flex items-center justify-between mb-4');
-  header.appendChild(el('h1', 'text-2xl font-bold', 'Koleksi Kamu'));
-  const rightHdr = el('div', 'flex items-center gap-1');
+  const header = el('div', 'flex items-center justify-between mb-2');
+  const titleWrap = el('div', 'flex flex-col min-w-0');
+  titleWrap.appendChild(el('h1', 'text-2xl font-bold', 'Koleksi Kamu'));
+  // Sub-line: jumlah lagu + total ukuran. Tap → buka storage sheet.
+  const totalTracks = state.tracks.length;
+  const totalBytes = state.tracks.reduce((sum, t) => sum + (t.fileSize || 0), 0);
+  if (totalTracks > 0) {
+    const statBtn = el('button', 'flex items-center gap-1.5 mt-0.5 text-xs text-spo-textMuted hover:text-white transition self-start');
+    statBtn.appendChild(el('span', 'tabular-nums', `${totalTracks} lagu`));
+    statBtn.appendChild(el('span', 'text-white/30', '·'));
+    statBtn.appendChild(el('span', 'tabular-nums', formatFileSize(totalBytes)));
+    const ic = el('span', 'text-white/40');
+    ic.innerHTML = svgIcon('chevron-down', 12);
+    ic.style.transform = 'rotate(-90deg)';
+    ic.style.display = 'inline-flex';
+    statBtn.appendChild(ic);
+    statBtn.onclick = () => openStorageSheet();
+    titleWrap.appendChild(statBtn);
+  }
+  header.appendChild(titleWrap);
+  const rightHdr = el('div', 'flex items-center gap-1 flex-shrink-0');
   const settingsBtn = el('button', 'p-2 hover:bg-white/10 rounded-full transition');
   settingsBtn.innerHTML = svgIcon('settings', 22);
   settingsBtn.onclick = () => setState({ settingsSheetOpen: true });
@@ -2905,6 +2929,9 @@ function renderLibraryView() {
   rightHdr.appendChild(importBtn);
   header.appendChild(rightHdr);
   wrap.appendChild(header);
+
+  // Spacer biar gap ke chips konsisten
+  wrap.appendChild(el('div', 'h-2'));
 
   // Filter chips
   const chipsWrap = el('div', 'flex gap-2 mb-4 overflow-x-auto scroll-y');
@@ -4695,6 +4722,27 @@ function renderSettingsSheet() {
   };
   sheet.appendChild(healthRow);
 
+  // --- Penyimpanan & Statistik ---
+  const storageRow = el('button', 'w-full flex items-center gap-3 px-5 py-3 hover:bg-white/5 transition text-left');
+  const storageIc = el('div', 'flex-shrink-0 text-blue-400');
+  storageIc.innerHTML = svgIcon('database', 22);
+  storageRow.appendChild(storageIc);
+  const storageText = el('div', 'flex-1 min-w-0');
+  storageText.appendChild(el('div', 'font-semibold', 'Penyimpanan & statistik'));
+  storageText.appendChild(el('div', 'text-xs text-spo-textMuted mt-0.5', 'Lihat jumlah lagu, total ukuran file, kuota perangkat, dan lagu paling besar.'));
+  storageRow.appendChild(storageText);
+  const storageArrow = el('div', 'flex-shrink-0 text-white/40');
+  storageArrow.innerHTML = svgIcon('chevron-down', 18);
+  storageArrow.style.transform = 'rotate(-90deg)';
+  storageRow.appendChild(storageArrow);
+  storageRow.onclick = () => {
+    closeSheetWithAnim(overlay, sheet, () => {
+      setState({ settingsSheetOpen: false });
+      setTimeout(() => openStorageSheet(), 50);
+    });
+  };
+  sheet.appendChild(storageRow);
+
   // Padding bawah
   sheet.appendChild(el('div', 'h-8'));
 
@@ -5125,6 +5173,377 @@ async function openHealthCheck() {
 
   if (broken.length === 0 && missingDur.length === 0) {
     body.appendChild(el('div', 'text-center text-spo-green text-lg py-8', '🎉 Koleksi 100% sehat'));
+  }
+}
+
+// =====================================================================
+// Storage & Statistics
+// =====================================================================
+// Hitung kuota perangkat (browser quota) — biasanya puluhan GB di Android Chrome.
+// navigator.storage.estimate() return { quota, usage } dalam bytes.
+async function getStorageEstimate() {
+  try {
+    if (navigator.storage && navigator.storage.estimate) {
+      const est = await navigator.storage.estimate();
+      return {
+        usage: est.usage || 0,
+        quota: est.quota || 0,
+        supported: true,
+      };
+    }
+  } catch (e) { /* ignore */ }
+  return { usage: 0, quota: 0, supported: false };
+}
+
+// Hitung statistik koleksi dari state.tracks
+function computeCollectionStats() {
+  const tracks = state.tracks;
+  let totalBytes = 0;
+  let totalDuration = 0;
+  let withCover = 0;
+  let withLyrics = 0;
+  let withSyncedLyrics = 0;
+  let unknownArtist = 0;
+  const formats = {};
+  for (const t of tracks) {
+    totalBytes += t.fileSize || 0;
+    totalDuration += t.duration || 0;
+    if (t.cover) withCover++;
+    if (t.lyrics) withLyrics++;
+    if (t.lyricsSynced) withSyncedLyrics++;
+    if (!t.artist || t.artist === 'Unknown Artist') unknownArtist++;
+    const ext = (t.fileName || '').split('.').pop().toLowerCase();
+    if (ext) formats[ext] = (formats[ext] || 0) + 1;
+  }
+  return {
+    totalTracks: tracks.length,
+    totalBytes,
+    totalDuration,
+    withCover,
+    withLyrics,
+    withSyncedLyrics,
+    unknownArtist,
+    formats,
+    avgBytes: tracks.length > 0 ? totalBytes / tracks.length : 0,
+  };
+}
+
+// Format durasi panjang ke "X jam Y menit" (bukan mm:ss seperti formatDuration)
+function formatLongDuration(seconds) {
+  if (!seconds || !isFinite(seconds)) return '0 menit';
+  const totalMin = Math.floor(seconds / 60);
+  const hours = Math.floor(totalMin / 60);
+  const mins = totalMin % 60;
+  if (hours === 0) return `${mins} menit`;
+  return `${hours} jam ${mins} menit`;
+}
+
+// ----- Storage & Statistics Sheet -----
+async function openStorageSheet() {
+  const dialog = el('div', 'fixed inset-0 z-[70] flex flex-col bg-spo-bg safe-top safe-bottom');
+  const closeDialog = () => { if (dialog.parentNode) dialog.remove(); unregisterDomDialog(closeDialog); };
+
+  // Top bar
+  const top = el('div', 'flex items-center p-3 border-b border-white/10 flex-shrink-0');
+  const close = el('button', 'p-2 hover:bg-white/10 rounded-full');
+  close.innerHTML = svgIcon('close', 22);
+  close.onclick = closeDialog;
+  top.appendChild(close);
+  top.appendChild(el('div', 'flex-1 text-center font-bold truncate px-2', 'Penyimpanan & Statistik'));
+  top.appendChild(el('div', 'w-9'));
+  dialog.appendChild(top);
+
+  const body = el('div', 'flex-1 overflow-y-auto scroll-y');
+  dialog.appendChild(body);
+
+  // Loading
+  const loading = el('div', 'flex flex-col items-center justify-center py-16');
+  loading.appendChild(el('div', 'text-blue-400 mb-3 text-3xl', '💾'));
+  loading.appendChild(el('div', 'text-sm text-spo-textMuted', 'Menghitung...'));
+  body.appendChild(loading);
+
+  document.body.appendChild(dialog);
+  registerDomDialog(closeDialog);
+
+  // Hitung stats
+  const stats = computeCollectionStats();
+  const est = await getStorageEstimate();
+  body.innerHTML = '';
+
+  // ===== Hero card: kuota perangkat =====
+  const hero = el('div', 'mx-4 mt-4 rounded-2xl p-5 bg-gradient-to-br from-blue-600/20 to-purple-600/10 border border-white/10');
+  hero.appendChild(el('div', 'text-xs uppercase tracking-wider text-blue-300/80 mb-1', 'Penyimpanan terpakai'));
+
+  if (est.supported && est.quota > 0) {
+    const pct = (est.usage / est.quota) * 100;
+    const pctClamped = Math.max(0, Math.min(100, pct));
+    // Warna progress: hijau < 70%, kuning 70-90%, merah > 90%
+    const barColor = pct > 90 ? 'bg-red-500' : pct > 70 ? 'bg-yellow-400' : 'bg-spo-green';
+    const txtColor = pct > 90 ? 'text-red-400' : pct > 70 ? 'text-yellow-300' : 'text-white';
+
+    const big = el('div', `text-2xl font-bold ${txtColor} tabular-nums`,
+      `${formatFileSize(est.usage)} / ${formatFileSize(est.quota)}`);
+    hero.appendChild(big);
+
+    hero.appendChild(el('div', 'text-xs text-white/60 mt-1', `${pct.toFixed(1)}% dari kuota perangkat terpakai`));
+
+    // Progress bar
+    const barWrap = el('div', 'mt-3 h-2 bg-white/10 rounded-full overflow-hidden');
+    const bar = el('div', `h-full ${barColor} rounded-full transition-all`);
+    bar.style.width = `${pctClamped}%`;
+    barWrap.appendChild(bar);
+    hero.appendChild(barWrap);
+
+    // Warning kalau hampir penuh
+    if (pct > 90) {
+      hero.appendChild(el('div', 'mt-3 text-xs text-red-300', '⚠ Hampir penuh — sebaiknya hapus lagu yang jarang diputar.'));
+    } else if (pct > 70) {
+      hero.appendChild(el('div', 'mt-3 text-xs text-yellow-300', 'Mulai mendekati limit. Cek "Lagu paling besar" di bawah.'));
+    } else {
+      const sisaBytes = est.quota - est.usage;
+      const avgBytes = stats.avgBytes || (5 * 1024 * 1024); // asumsi 5MB/lagu kalau koleksi kosong
+      const estTracks = Math.floor(sisaBytes / avgBytes);
+      hero.appendChild(el('div', 'mt-3 text-xs text-white/60', `Sisa ~${formatFileSize(sisaBytes)} (≈ ${estTracks.toLocaleString('id-ID')} lagu lagi)`));
+    }
+  } else {
+    hero.appendChild(el('div', 'text-base text-white/70', 'Browser tidak melaporkan kuota.'));
+    hero.appendChild(el('div', 'text-xs text-white/50 mt-1', 'Penyimpanan Sonara dibatasi oleh sisa ruang HP. Biasanya beberapa GB di Android.'));
+  }
+  body.appendChild(hero);
+
+  // ===== Edu: cara kerja kuota =====
+  const eduBox = el('details', 'mx-4 mt-3 rounded-lg bg-white/5 border border-white/10');
+  const eduSum = el('summary', 'px-4 py-2.5 text-sm font-semibold cursor-pointer flex items-center justify-between');
+  eduSum.appendChild(el('span', '', 'Bagaimana kuota dihitung?'));
+  const chev = el('span', 'text-white/40');
+  chev.innerHTML = svgIcon('chevron-down', 16);
+  eduSum.appendChild(chev);
+  eduBox.appendChild(eduSum);
+  const eduTxt = el('div', 'px-4 pb-3 text-xs text-white/60 leading-relaxed');
+  eduTxt.innerHTML = `
+    Sonara menyimpan lagu di <b>storage browser</b> (IndexedDB), bukan di galeri HP.
+    Kuota ini ditentukan oleh browser: di Android Chrome biasanya sampai <b>60% dari ruang kosong HP</b> (puluhan GB).
+    Kalau HP-mu makin penuh dengan foto/app lain, kuota Sonara ikut turun.
+    <br><br>
+    <b>Apa yang masuk hitungan?</b> File audio (paling besar), cover art, lirik, dan metadata.
+    Hapus lagu dari Sonara → ruang kembali otomatis.
+  `;
+  eduBox.appendChild(eduTxt);
+  body.appendChild(eduBox);
+
+  // ===== Section: Ringkasan koleksi =====
+  const sec1 = el('div', 'px-5 pt-5 pb-2 text-xs uppercase tracking-wider text-spo-textMuted', 'Koleksi kamu');
+  body.appendChild(sec1);
+
+  // Grid stats 2x2
+  const grid = el('div', 'grid grid-cols-2 gap-3 px-4');
+  const statCard = (icon, label, value, sub = '') => {
+    const c = el('div', 'rounded-xl p-3 bg-white/5');
+    c.appendChild(el('div', 'text-xl mb-1', icon));
+    c.appendChild(el('div', 'text-lg font-bold tabular-nums', value));
+    c.appendChild(el('div', 'text-xs text-white/60', label));
+    if (sub) c.appendChild(el('div', 'text-[10px] text-white/40 mt-0.5', sub));
+    return c;
+  };
+  grid.appendChild(statCard('🎵', 'Total lagu', stats.totalTracks.toLocaleString('id-ID')));
+  grid.appendChild(statCard('💿', 'Ukuran file', formatFileSize(stats.totalBytes)));
+  grid.appendChild(statCard('⏱️', 'Total durasi', formatLongDuration(stats.totalDuration)));
+  const avgKb = stats.avgBytes > 0 ? formatFileSize(stats.avgBytes) : '—';
+  grid.appendChild(statCard('📊', 'Rata-rata per lagu', avgKb));
+  body.appendChild(grid);
+
+  // ===== Section: Detail =====
+  const sec2 = el('div', 'px-5 pt-5 pb-2 text-xs uppercase tracking-wider text-spo-textMuted', 'Detail');
+  body.appendChild(sec2);
+
+  const detailWrap = el('div', 'mx-4 rounded-xl bg-white/5 divide-y divide-white/5');
+  const detailRow = (label, value, color = '') => {
+    const r = el('div', 'flex items-center justify-between px-4 py-2.5');
+    r.appendChild(el('div', 'text-sm text-white/70', label));
+    r.appendChild(el('div', `text-sm font-semibold tabular-nums ${color}`, value));
+    return r;
+  };
+  detailWrap.appendChild(detailRow('Lagu dengan cover art', `${stats.withCover} / ${stats.totalTracks}`));
+  detailWrap.appendChild(detailRow('Lagu dengan lirik', `${stats.withLyrics} / ${stats.totalTracks}`));
+  detailWrap.appendChild(detailRow('Lirik tersinkron (synced)', `${stats.withSyncedLyrics} / ${stats.totalTracks}`));
+  if (stats.unknownArtist > 0) {
+    detailWrap.appendChild(detailRow('Tanpa info artis', `${stats.unknownArtist}`, 'text-yellow-400'));
+  }
+  // Format breakdown
+  const formatList = Object.entries(stats.formats).sort((a, b) => b[1] - a[1]);
+  if (formatList.length > 0) {
+    const formatStr = formatList.map(([fmt, cnt]) => `${fmt.toUpperCase()} ${cnt}`).join(' · ');
+    detailWrap.appendChild(detailRow('Format file', formatStr));
+  }
+  body.appendChild(detailWrap);
+
+  // ===== Section: Tindakan =====
+  if (stats.totalTracks > 0) {
+    const sec3 = el('div', 'px-5 pt-5 pb-2 text-xs uppercase tracking-wider text-spo-textMuted', 'Tindakan');
+    body.appendChild(sec3);
+
+    const actionWrap = el('div', 'mx-4 rounded-xl bg-white/5 divide-y divide-white/5 overflow-hidden');
+
+    // --- Lihat lagu paling besar ---
+    const largestBtn = el('button', 'w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition text-left');
+    const lIc = el('div', 'flex-shrink-0 text-orange-400');
+    lIc.innerHTML = svgIcon('sort', 22);
+    largestBtn.appendChild(lIc);
+    const lTxt = el('div', 'flex-1 min-w-0');
+    lTxt.appendChild(el('div', 'text-sm font-semibold', 'Lagu paling besar'));
+    lTxt.appendChild(el('div', 'text-xs text-white/50', 'Urut dari file paling boros ruang'));
+    largestBtn.appendChild(lTxt);
+    const lArrow = el('div', 'text-white/40');
+    lArrow.innerHTML = svgIcon('chevron-down', 16);
+    lArrow.style.transform = 'rotate(-90deg)';
+    largestBtn.appendChild(lArrow);
+    largestBtn.onclick = () => {
+      closeDialog();
+      setTimeout(() => openLargestTracksDialog(), 50);
+    };
+    actionWrap.appendChild(largestBtn);
+
+    // --- Cari duplikat ---
+    const dedupeBtn = el('button', 'w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition text-left');
+    const dIc = el('div', 'flex-shrink-0 text-spo-green');
+    dIc.innerHTML = svgIcon('search', 22);
+    dedupeBtn.appendChild(dIc);
+    const dTxt = el('div', 'flex-1 min-w-0');
+    dTxt.appendChild(el('div', 'text-sm font-semibold', 'Cari lagu duplikat'));
+    dTxt.appendChild(el('div', 'text-xs text-white/50', 'Hapus salinan untuk hemat ruang'));
+    dedupeBtn.appendChild(dTxt);
+    const dArrow = el('div', 'text-white/40');
+    dArrow.innerHTML = svgIcon('chevron-down', 16);
+    dArrow.style.transform = 'rotate(-90deg)';
+    dedupeBtn.appendChild(dArrow);
+    dedupeBtn.onclick = () => {
+      closeDialog();
+      setTimeout(() => openDedupeFinder(), 50);
+    };
+    actionWrap.appendChild(dedupeBtn);
+
+    // --- Cek kesehatan (hapus file rusak) ---
+    const healthBtn = el('button', 'w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition text-left');
+    const hIc = el('div', 'flex-shrink-0 text-orange-400');
+    hIc.innerHTML = svgIcon('check-circle', 22);
+    healthBtn.appendChild(hIc);
+    const hTxt = el('div', 'flex-1 min-w-0');
+    hTxt.appendChild(el('div', 'text-sm font-semibold', 'Cek kesehatan koleksi'));
+    hTxt.appendChild(el('div', 'text-xs text-white/50', 'Hapus file audio yang rusak/hilang'));
+    healthBtn.appendChild(hTxt);
+    const haArrow = el('div', 'text-white/40');
+    haArrow.innerHTML = svgIcon('chevron-down', 16);
+    haArrow.style.transform = 'rotate(-90deg)';
+    healthBtn.appendChild(haArrow);
+    healthBtn.onclick = () => {
+      closeDialog();
+      setTimeout(() => openHealthCheck(), 50);
+    };
+    actionWrap.appendChild(healthBtn);
+
+    body.appendChild(actionWrap);
+  }
+
+  body.appendChild(el('div', 'h-8'));
+}
+
+// ----- Largest Tracks Dialog (sort by file size, allow delete) -----
+async function openLargestTracksDialog() {
+  const dialog = el('div', 'fixed inset-0 z-[70] flex flex-col bg-spo-bg safe-top safe-bottom');
+  const closeDialog = () => { if (dialog.parentNode) dialog.remove(); unregisterDomDialog(closeDialog); };
+
+  const top = el('div', 'flex items-center p-3 border-b border-white/10 flex-shrink-0');
+  const close = el('button', 'p-2 hover:bg-white/10 rounded-full');
+  close.innerHTML = svgIcon('close', 22);
+  close.onclick = closeDialog;
+  top.appendChild(close);
+  top.appendChild(el('div', 'flex-1 text-center font-bold truncate px-2', 'Lagu Paling Besar'));
+  top.appendChild(el('div', 'w-9'));
+  dialog.appendChild(top);
+
+  const body = el('div', 'flex-1 overflow-y-auto scroll-y');
+  dialog.appendChild(body);
+
+  document.body.appendChild(dialog);
+  registerDomDialog(closeDialog);
+
+  const renderList = () => {
+    body.innerHTML = '';
+    // Sort by fileSize descending; missing fileSize = 0 (di belakang)
+    const sorted = [...state.tracks].sort((a, b) => (b.fileSize || 0) - (a.fileSize || 0));
+    if (sorted.length === 0) {
+      body.appendChild(el('div', 'text-center text-spo-textMuted py-12', 'Koleksi kosong'));
+      return;
+    }
+
+    // Header info
+    const totalBytes = sorted.reduce((s, t) => s + (t.fileSize || 0), 0);
+    const head = el('div', 'px-4 pt-4 pb-2');
+    head.appendChild(el('div', 'text-sm text-white/60', `${sorted.length} lagu · total ${formatFileSize(totalBytes)}`));
+    head.appendChild(el('div', 'text-xs text-white/40 mt-0.5', 'Tap ikon hapus di kanan untuk menghapus lagu.'));
+    body.appendChild(head);
+
+    // List
+    sorted.forEach((t, idx) => {
+      const row = el('div', 'flex items-center gap-3 px-4 py-2.5 hover:bg-white/5');
+      // Rank
+      const rank = el('div', 'w-6 text-center text-sm text-white/40 tabular-nums flex-shrink-0', String(idx + 1));
+      row.appendChild(rank);
+      // Cover
+      const cov = el('div', 'w-11 h-11 bg-spo-elevated rounded flex-shrink-0');
+      if (t.cover) {
+        const cu = coverUrl(t);
+        if (cu) { cov.style.backgroundImage = `url(${cu})`; cov.style.backgroundSize = 'cover'; cov.style.backgroundPosition = 'center'; }
+      }
+      row.appendChild(cov);
+      // Info
+      const info = el('div', 'flex-1 min-w-0 cursor-pointer');
+      info.appendChild(el('div', 'text-sm font-semibold truncate', t.title || 'Tanpa judul'));
+      const sub = el('div', 'text-xs text-spo-textMuted truncate', `${t.artist || 'Unknown'} · ${formatDuration(t.duration || 0)}`);
+      info.appendChild(sub);
+      info.onclick = () => playFromList(sorted, idx, { type: 'largest' });
+      row.appendChild(info);
+      // Size
+      const sz = el('div', 'text-sm font-semibold tabular-nums text-white/80 flex-shrink-0', formatFileSize(t.fileSize || 0));
+      row.appendChild(sz);
+      // Delete btn
+      const delBtn = el('button', 'p-2 hover:bg-red-500/20 rounded-full text-red-400 flex-shrink-0');
+      delBtn.innerHTML = svgIcon('trash', 18);
+      delBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Hapus "${t.title}"?\nUkuran: ${formatFileSize(t.fileSize || 0)}`)) return;
+        await deleteTrack(t.id);
+        renderList();
+      };
+      row.appendChild(delBtn);
+      body.appendChild(row);
+    });
+
+    body.appendChild(el('div', 'h-8'));
+  };
+
+  renderList();
+}
+
+// Pre-import quota check: kalau total ukuran file yang mau di-import > sisa kuota,
+// tampilkan warning. Return true kalau OK lanjut, false kalau batal.
+async function checkImportQuota(files) {
+  try {
+    const est = await getStorageEstimate();
+    if (!est.supported || est.quota === 0) return true; // browser gak support, skip
+    const incomingBytes = Array.from(files).reduce((s, f) => s + (f.size || 0), 0);
+    const sisa = est.quota - est.usage;
+    // Threshold: kalau incoming > 90% sisa, warn
+    if (incomingBytes > sisa * 0.9) {
+      const msg = `⚠ Penyimpanan hampir penuh\n\n` +
+        `Mau import: ${formatFileSize(incomingBytes)}\n` +
+        `Sisa kuota: ${formatFileSize(sisa)}\n\n` +
+        `Import mungkin gagal di tengah jalan. Lanjut?`;
+      return confirm(msg);
+    }
+    return true;
+  } catch (e) {
+    return true;
   }
 }
 
@@ -5627,6 +6046,7 @@ function svgIcon(name, size = 24) {
     settings: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>`,
     waves: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12c1.5-2 3-2 4.5 0s3 2 4.5 0 3-2 4.5 0 3 2 4.5 0M2 18c1.5-2 3-2 4.5 0s3 2 4.5 0 3-2 4.5 0 3 2 4.5 0M2 6c1.5-2 3-2 4.5 0s3 2 4.5 0 3-2 4.5 0 3 2 4.5 0"/></svg>`,
     video: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="M22 8l-6 4 6 4V8z"/></svg>`,
+    database: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></svg>`,
   };
   return icons[name] || `<svg width="${s}" height="${s}" viewBox="0 0 24 24"></svg>`;
 }

@@ -1,5 +1,26 @@
 # Sonara Changelog
 
+## v13.2 — Penyimpanan & Statistik (Mei 2026)
+
+### 🆕 Penyimpanan & Statistik
+
+- **Badge tap-able di Koleksi.** Di bawah judul "Koleksi Kamu" sekarang ada baris kecil `89 lagu · 245 MB ›`. Tap → buka sheet detail.
+- **Sheet detail penyimpanan** (juga bisa diakses dari Pengaturan → Koleksi → "Penyimpanan & statistik"):
+  - **Kuota perangkat** — total terpakai / total kuota yang dialokasikan browser. Progress bar warna: hijau (<70%), kuning (70–90%), merah (>90%).
+  - **Estimasi sisa** — "Sisa ~3.2 GB (≈ 640 lagu lagi)" — dihitung dari rata-rata ukuran lagu di koleksimu.
+  - **Penjelasan kuota** — collapsible "Bagaimana kuota dihitung?" — jelasin kalau Sonara nyimpan di storage browser, bukan galeri HP, dan kuota Android Chrome biasanya ~60% dari ruang kosong HP.
+  - **Statistik koleksi** — total lagu, total ukuran file, total durasi (jam:menit), rata-rata per lagu.
+  - **Detail breakdown** — lagu dengan cover, lagu dengan lirik, lirik tersinkron, lagu tanpa artis, breakdown format file (MP3, M4A, FLAC, dll).
+  - **Tindakan cepat** — shortcut ke Lagu Paling Besar, Cari Duplikat, Cek Kesehatan.
+- **Lagu Paling Besar (sorter)** — list semua lagu di-sort dari file terbesar duluan. Setiap baris ada ukuran + tombol hapus. Tap nama lagu → langsung play. Berguna untuk hapus file FLAC/WAV yang boros ruang.
+- **Peringatan otomatis saat import.** Kalau total ukuran file yang mau di-import > 90% sisa kuota, tampil konfirmasi sebelum lanjut. Hindari import gagal di tengah jalan karena kehabisan ruang.
+
+### Deploy
+
+Upload **index.html** + **sw.js** → SW v20 auto-update.
+
+---
+
 ## v13.1 — Fix daftar Artis terpotong (Mei 2026)
 
 ### 🐛 Bug fix utama
