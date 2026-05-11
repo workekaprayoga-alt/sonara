@@ -1,109 +1,70 @@
-# Sonara v9 — Music Video Canvas + Lirik Fix
+# Sonara v11 — Cleanup & Lirik Halaman Terpisah
 
-Versi ini ganti **Mode Vinyl → Canvas video / Ken Burns animasi**, plus fix bug lirik tembus vinyl, plus auto-import lirik dari MP3 yang udah punya lirik embedded.
+Release ini fokus bersih-bersih: hapus fitur yang gak kepake atau bikin ribet, fix
+tombol-tombol yang mati, dan pisahkan lirik jadi halaman tersendiri supaya gak
+tindih background full player.
 
-## 🎬 Fitur baru: Canvas Video (Spotify-style)
+## 🗑️ Dihapus
 
-Full player sekarang pakai sistem 2-layer background:
+- **Canvas video** — fitur upload .mp4 per lagu. Capek nge-upload satu-satu dan
+  storage HP cepat penuh. Default sekarang cuma Ken Burns cover (slow zoom-pan).
+- **Equalizer 5-band** — efeknya subtle dan beberapa preset malah bikin audio
+  jelek di speaker HP. Pakai aja audio asli MP3-nya.
+- **Volume normalization** — peak detection async yang kadang lambat, efek
+  marginal. Skip.
+- **Mode Vinyl** — sisa-sisa v8 (state DB tetap untuk backward-compat).
+- **Tombol Device** (pojok kiri bawah full player) — Sonara cuma main di HP
+  sendiri, gak ada konsep Spotify Connect.
+- **Tombol Share** (pojok kanan full player) — sesuai permintaan.
+- **Tombol Download** di header album — semua lagu udah lokal, gak ada konsep
+  download.
 
-### 1. Default — Cover Animasi (Ken Burns)
-Otomatis untuk **semua lagu**. Cover di-blur + zoom-pan pelan (28 detik per cycle), dengan layer kedua yang gerak arah berlawanan 32 detik. Plus color theme adaptif (gradient dari warna dominan cover).
+## ✨ Ditambah
 
-Saat audio pause, animasi pause di posisi terakhir. Saat resume, lanjut dari titik yang sama.
+### Lirik halaman terpisah penuh
 
-Hasilnya: full player hidup tanpa user perlu upload apa-apa. Lebih dinamis dari blur statis sebelumnya.
+Tap **LIRIK** di full player → halaman lirik baru muncul (slide-up, full-screen),
+bukan overlay tindih background lagi.
 
-### 2. Upgrade — Canvas Video (.mp4 / .webm)
-Untuk lagu favorit, user bisa **upload video pendek looping** seperti Spotify Canvas:
-- Tap ⋯ pada lagu → **"Upload Canvas video"**
-- Pilih file .mp4 / .webm (max 25 MB, ideal: 5–15 detik, resolusi 480p–720p)
-- Video disimpan permanen di IndexedDB
-- Saat lagu diputar, video loop di background full player
-- Audio tetap dari MP3 (video di-mute otomatis)
-- Pause audio → pause video juga
+- **Synced lyrics**: tetap auto-scroll dengan highlight + center baris aktif.
+  Tap baris = jump ke timestamp itu.
+- **Plain lyrics**: scroll biasa, font size lebih besar (text-lg, semibold).
+- **Bottom mini-player**: seek bar + play/pause di bawah, jadi gak perlu close
+  lirik buat kontrol musik.
+- **Top bar**: cover kecil + judul + artis + tombol ⋯ (akses context menu lagu).
+- Background: cover blur tipis + gradient hitam — tetap konsisten dengan vibe
+  full player, tanpa interference.
 
-Untuk hapus: ⋯ → **"Hapus Canvas video"**.
+### Tombol ⋯ di header album / artis / playlist
 
-## 🐛 Bug fix penting
+Sebelumnya cuma icon mati. Sekarang fungsional:
 
-### Lirik tembus background (vinyl/canvas)
-Sebelum: tap LIRIK → lirik nampak transparan di atas vinyl/cover → lirik gak keliatan jelas.
+- **Album / Artis**: Putar semua, Acak semua, Tambah semua ke antrean,
+  Tambah semua ke playlist.
+- **Playlist**: di atas itu + Ganti cover playlist + Hapus playlist (dengan
+  konfirmasi).
 
-Sekarang: lyrics panel pakai **solid gradient background** (rgba(0,0,0,0.92) → 0.99). Lirik tampil di atas latar gelap tanpa distraksi dari video/animasi di belakang. Saat lirik ditutup, fade balik ke video/cover animasi smooth.
+### Scroll position restore
 
-### Mode Vinyl dihapus
-Sesuai pilihan: vinyl digantikan total dengan Canvas/Ken Burns. Setting "Mode Vinyl" di Pengaturan dihilangkan.
+Sebelumnya tiap kali masuk sub-view (album/artis/playlist) lalu kembali, scroll
+loncat balik ke atas. Sekarang posisi scroll disimpan per-view dan di-restore
+otomatis saat balik — gak perlu scroll ulang dari atas.
 
-## 🎵 Auto-import lirik dari MP3
+## 🐛 Fix
 
-Parser ID3 sekarang baca **3 sumber lirik dari MP3**:
+- Lirik tidak lagi tampak "tindih" canvas/cover karena sekarang full screen.
+- Tombol-tombol di header album yang dulu dummy (download, more) sekarang
+  berfungsi semua.
 
-1. **USLT** (Unsynchronized Lyrics) — standar resmi ID3v2
-2. **SYLT** (Synchronized Lyrics) — jarang tapi ada, auto-convert ke LRC equivalent
-3. **TXXX** dengan description `lyrics-*` atau `LYRICS` — non-standar tapi banyak dipakai converter YT Music dan tool sejenis (contoh: MP3 Sal Priadi yang kamu test)
+## 📦 Deploy
 
-Bonus: kalau MP3 punya lirik embedded yang ternyata pakai format LRC (ada timestamp `[mm:ss]`), auto di-convert jadi synced lyrics yang highlight per baris.
+Upload 2 file: `index.html`, `sw.js`. Vercel redeploy, SW auto-update ke v16.
 
-Buffer parser juga diperbesar 256 KB → 1 MB supaya tag besar (lirik panjang + cover art 100+ KB) tetap ke-parse penuh.
-
-**Prioritas lirik saat import:**
-1. File sidecar .lrc atau .txt (paling akurat)
-2. MP3 USLT
-3. MP3 TXXX:lyrics-*
-4. MP3 SYLT (synced)
-
-## 📁 File yang berubah
-
-3 file:
-1. `index.html` — semua perubahan UI + parser
-2. `sw.js` — bump cache `sonara-v14`
-3. `CHANGELOG.md` — (file ini)
-
-## 🚀 Deploy
-1. Upload `index.html` + `sw.js` ke GitHub
-2. Tunggu Vercel redeploy ~30 detik
-3. Tutup app → buka lagi → SW update ke v14
-
-## ✅ Test checklist
-
-**Ken Burns (default):**
-- ✅ Buka full player → cover blur perlahan zoom-pan (gak statis lagi)
-- ✅ Pause audio → animasi berhenti, resume → lanjut dari posisi yang sama
-
-**Canvas Video:**
-- ✅ ⋯ pada lagu → klik **Upload Canvas video** → pilih .mp4 → toast "Canvas video tersimpan ✨"
-- ✅ Buka full player → video loop di background
-- ✅ Pause audio → video ikut pause
-- ✅ ⋯ lagi → **Hapus Canvas video** → balik ke Ken Burns mode
-
-**Lirik di atas Canvas:**
-- ✅ Buka full player dengan canvas/cover → tap LIRIK → lirik muncul di latar gelap solid (gak tembus)
-- ✅ Tap LIRIK lagi → fade balik ke video/cover
-
-**Auto-import lirik (penting buat dicoba):**
-- ✅ Import ulang MP3 Sal Priadi → lirik auto-muncul (gak perlu paste manual)
-- ✅ Buka full player → tombol "LIRIK" muncul otomatis di top bar
-
-## 📊 Roadmap
-
-| Versi | Status | % Spotify-feel |
-|-------|--------|----------------|
-| v8 | ✅ Done | ~89% |
-| v9 | ✅ Done | ~93% |
-| v10 | Next | ~97% (Backup/Restore, Tag editor, Drag-reorder, Bulk ops) |
-| v11 | Final | ~99% (Podcast, micro-interactions) |
-
-## 💡 Tips Canvas video
-
-Resolusi & ukuran ideal:
-- **480p** (854×480) → ukuran 2–5 MB → loading cepat, kualitas cukup di HP
-- **720p** (1280×720) → ukuran 5–15 MB → premium feel
-- **Hindari 1080p** kecuali video sangat pendek (< 5 detik) → boros storage
-
-Sumber Canvas video (legal):
-- Record sendiri (10 detik dari video musik di YouTube lalu screen-record)
-- Convert dari GIF favorit (banyak converter online: gif-to-mp4)
-- Pinterest/IG Reels download
-- Live wallpaper APK extractor
-
-Saran format: **MP4 H.264** paling kompatibel di semua browser HP.
+Test penting:
+1. Buka full player → tap LIRIK → halaman lirik full slide-up dari bawah.
+   Tombol kembali (Android) atau chevron-down menutup ke full player.
+2. Buka album manapun → tap ⋯ di header → coba "Putar semua" / "Acak semua".
+3. Scroll di Home, masuk ke album, kembali → scroll harusnya tetap di posisi
+   yang sama, bukan balik ke atas.
+4. Pengaturan → tidak ada lagi toggle Equalizer / Normalisasi volume / Mode
+   Vinyl. Tinggal Crossfade, Gapless, Sleep fade-out, dan Cari lagu duplikat.
