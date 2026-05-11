@@ -402,9 +402,11 @@ async function extractMetadata(file) {
     await new Promise((res) => {
       audio.addEventListener('loadedmetadata', res, { once: true });
       audio.addEventListener('error', res, { once: true });
-      setTimeout(res, 3000);
+      setTimeout(res, 5000); // 5 detik supaya HP slow tetap dapat durasi
     });
-    meta.duration = audio.duration || 0;
+    const d = audio.duration;
+    // Handle MP3 VBR yang report Infinity/NaN — biarin 0, akan di-fix saat play
+    meta.duration = (isFinite(d) && d > 0) ? d : 0;
     URL.revokeObjectURL(url);
   } catch {}
 
@@ -872,15 +874,45 @@ async function loadAndPlay(track) {
   // FLUSH session sebelumnya kalau ada — lagu sebelumnya udah selesai didengar
   flushListeningSession();
 
+  // === Validasi blob: kalau hilang/corrupt, kasih tau user, jangan silent-fail ===
+  // Bisa terjadi kalau: storage IndexedDB di-evict browser, quota habis saat import,
+  // atau bug import lama. Cek track.blob ada dan ukurannya > 0.
+  if (!track.blob || !(track.blob instanceof Blob) || track.blob.size === 0) {
+    showToast(`"${track.title}" tidak bisa diputar — file audio hilang. Import ulang lagu ini.`, 4500, 'error');
+    return;
+  }
+
   if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
-  currentObjectUrl = URL.createObjectURL(track.blob);
+  try {
+    currentObjectUrl = URL.createObjectURL(track.blob);
+  } catch (e) {
+    showToast(`Gagal load "${track.title}" — file rusak. Import ulang lagu ini.`, 4500, 'error');
+    return;
+  }
   audio.src = currentObjectUrl;
   audio.volume = 1; // reset volume kalau bekas crossfade
   setState({ currentTrack: track });
-  try { await audio.play(); } catch (e) { console.warn(e); }
+  try { await audio.play(); } catch (e) {
+    console.warn('audio.play failed:', e);
+    showToast(`Gagal memutar "${track.title}". Coba lagi atau import ulang.`, 3500, 'error');
+    return;
+  }
 
   // Update Media Session
   updateMediaSession(track);
+
+  // Auto-fix durasi kalau 0 / NaN / Infinity — ukur ulang sekarang via audio element
+  // Lalu simpan ke DB supaya next time gak perlu ukur lagi.
+  if (!track.duration || !isFinite(track.duration) || track.duration <= 0) {
+    audio.addEventListener('loadedmetadata', async () => {
+      const d = audio.duration;
+      if (isFinite(d) && d > 0) {
+        track.duration = d;
+        try { await dbPut(STORE_TRACKS, track); } catch (e) {}
+        setState({ tracks: [...state.tracks] });
+      }
+    }, { once: true });
+  }
 
   // Recently played
   const rp = [track.id, ...state.recentlyPlayed.filter(id => id !== track.id)].slice(0, 50);
@@ -3509,18 +3541,18 @@ function renderFullPlayer() {
   // (old block dihapus — replaced with new canvas/Ken Burns block above)
   overlay.appendChild(bg);
 
-  // Content
+  // Content — top bar fixed, body scrollable
   const content = el('div', 'relative h-full flex flex-col safe-top safe-bottom z-10');
 
-  // Top bar
-  const top = el('div', 'flex items-center px-3 py-3');
+  // Top bar (FIXED — tidak ikut scroll)
+  const top = el('div', 'flex items-center px-3 py-3 flex-shrink-0');
   const down = el('button', 'p-2');
   down.innerHTML = svgIcon('chevron-down', 24);
   down.onclick = closeFull;
   top.appendChild(down);
   const titleC = el('div', 'flex-1 text-center');
   titleC.appendChild(el('div', 'text-[10px] tracking-wider text-white/70 uppercase', state.queueContext ? `Memainkan dari ${labelContextType(state.queueContext.type)}` : 'Memainkan'));
-  titleC.appendChild(el('div', 'text-sm font-bold', state.queueContext?.name || ''));
+  titleC.appendChild(el('div', 'text-sm font-bold truncate', state.queueContext?.name || ''));
   top.appendChild(titleC);
   const more = el('button', 'p-2');
   more.innerHTML = svgIcon('more', 22);
@@ -3528,11 +3560,7 @@ function renderFullPlayer() {
   top.appendChild(more);
   content.appendChild(top);
 
-  // Spacer di tengah (cover dari blurred bg di belakang, tidak ada panel di sini)
-  const middle = el('div', 'flex-1 relative');
-  content.appendChild(middle);
-
-  // Tombol LIRIK di top bar (kanan, sebelum tombol more) — buka halaman lirik terpisah
+  // Tombol LIRIK di top bar (sebelum tombol more)
   if (t.lyrics || t.lyricsSynced) {
     const lyricBtn = el('button', 'mr-1 px-3 py-1 rounded-full bg-white/15 text-xs font-semibold hover:bg-white/25 active:scale-95 transition');
     lyricBtn.textContent = 'LIRIK';
@@ -3540,12 +3568,28 @@ function renderFullPlayer() {
     top.insertBefore(lyricBtn, more);
   }
 
-  // Lirik preview (kalau ada — kita skip untuk sekarang, tampilkan info)
+  // === BODY SCROLLABLE ===
+  const body = el('div', 'flex-1 overflow-y-auto scroll-y');
+
+  // Cover besar di tengah (square, ~85vw, max 360px)
+  const coverWrap = el('div', 'flex justify-center px-6 mt-4 mb-6');
+  const coverBig = el('div', 'rounded-lg cover-shadow');
+  coverBig.style.aspectRatio = '1';
+  coverBig.style.width = 'min(85vw, 360px)';
+  coverBig.style.background = '#2a2a2a';
+  if (cu) {
+    coverBig.style.backgroundImage = `url(${cu})`;
+    coverBig.style.backgroundSize = 'cover';
+    coverBig.style.backgroundPosition = 'center';
+  }
+  coverWrap.appendChild(coverBig);
+  body.appendChild(coverWrap);
+
   // Track info row
   const info = el('div', 'px-6 mb-3 flex items-end justify-between gap-3');
   const tinfo = el('div', 'flex-1 min-w-0');
   tinfo.appendChild(el('div', 'text-2xl font-bold truncate', t.title));
-  const artistBtn = el('button', 'text-white/70 text-base text-left truncate w-full');
+  const artistBtn = el('button', 'text-white/70 text-base text-left truncate w-full hover:text-white transition');
   artistBtn.textContent = t.artist;
   artistBtn.onclick = () => {
     closeSheetWithAnim(overlay, overlay, () => setState({ view: 'artist', viewParam: t.artist, fullPlayerOpen: false }), true);
@@ -3557,17 +3601,15 @@ function renderFullPlayer() {
   likeBtn.innerHTML = svgIcon(t.liked ? 'check-circle-filled' : 'plus-circle', 28);
   likeBtn.onclick = () => toggleLike(t.id);
   info.appendChild(likeBtn);
-  content.appendChild(info);
+  body.appendChild(info);
 
-  // Progress bar — update via DOM listener (bukan re-render) supaya nggak loncat
+  // Progress bar
   const seekRow = el('div', 'px-6');
   const seek = el('input', 'seek');
   seek.type = 'range'; seek.min = 0; seek.max = audio.duration || 0; seek.step = 0.1; seek.value = audio.currentTime || 0;
-  // Style fill awal
   const initPct = (audio.currentTime / (audio.duration || 1)) * 100 || 0;
   seek.style.background = `linear-gradient(to right, #fff 0%, #fff ${initPct}%, rgba(255,255,255,0.3) ${initPct}%, rgba(255,255,255,0.3) 100%)`;
 
-  // Saat user pegang slider, jangan auto-update value-nya dari timeupdate (biar nggak "loncat" balik)
   let seeking = false;
   seek.addEventListener('pointerdown', () => { seeking = true; });
   seek.addEventListener('pointerup', () => { seeking = false; });
@@ -3582,9 +3624,8 @@ function renderFullPlayer() {
   times.appendChild(tCur);
   times.appendChild(tDur);
   seekRow.appendChild(times);
-  content.appendChild(seekRow);
+  body.appendChild(seekRow);
 
-  // DOM-only updates via time emitter
   const unsubTime = onTimeUpdate((cur, dur) => {
     if (!seek.isConnected) { unsubTime(); return; }
     if (!seeking) {
@@ -3619,28 +3660,154 @@ function renderFullPlayer() {
   sleep.innerHTML = svgIcon('timer', 24);
   sleep.onclick = () => setState({ sleepTimerSheetOpen: true });
   ctl.appendChild(sleep);
-  content.appendChild(ctl);
+  body.appendChild(ctl);
 
   // Sleep timer countdown
   if (state.sleepTimerEndsAt) {
     const remaining = Math.max(0, state.sleepTimerEndsAt - Date.now());
     const m = Math.floor(remaining / 60000);
     const s = Math.floor((remaining % 60000) / 1000);
-    content.appendChild(el('div', 'text-center text-xs text-spo-green mt-2', `Akan berhenti dalam ${m}:${s.toString().padStart(2, '0')}`));
+    body.appendChild(el('div', 'text-center text-xs text-spo-green mt-2', `Akan berhenti dalam ${m}:${s.toString().padStart(2, '0')}`));
   } else if (state.sleepTimerEndOfTrack) {
-    content.appendChild(el('div', 'text-center text-xs text-spo-green mt-2', 'Akan berhenti di akhir lagu'));
+    body.appendChild(el('div', 'text-center text-xs text-spo-green mt-2', 'Akan berhenti di akhir lagu'));
   }
 
-  // Bottom row: queue button (rata kanan)
-  const bottom = el('div', 'flex items-center justify-end px-6 mt-6 mb-4');
+  // Queue button row
+  const queueRow = el('div', 'flex items-center justify-end px-6 mt-6 mb-4');
   const queueBtn = el('button', 'p-2 text-white/70 hover:text-white active:scale-95 transition');
   queueBtn.innerHTML = svgIcon('queue', 22);
   queueBtn.onclick = () => setState({ queueSheetOpen: true });
-  bottom.appendChild(queueBtn);
-  content.appendChild(bottom);
+  queueRow.appendChild(queueBtn);
+  body.appendChild(queueRow);
 
+  // ===== Spotify-style sections di bawah kontrol pemutar =====
+  appendFullPlayerExploreSections(body, t, closeFull);
+
+  content.appendChild(body);
   overlay.appendChild(content);
   return overlay;
+}
+
+// Section "Jelajahi [artis]": Lagu lain, Album lain, Tentang artis.
+// Diambil murni dari koleksi user — tidak ada data eksternal.
+function appendFullPlayerExploreSections(body, t, closeFull) {
+  if (!t.artist) return;
+
+  // Lagu lain dari artis ini (selain lagu yg lagi diputar)
+  const otherByArtist = state.tracks
+    .filter(x => x.artist === t.artist && x.id !== t.id)
+    .slice(0, 8);
+
+  // Album lain dari artis ini (selain album lagu sekarang)
+  const albumsByArtist = [...new Set(
+    state.tracks
+      .filter(x => x.artist === t.artist && x.album && x.album !== t.album)
+      .map(x => x.album)
+  )].slice(0, 6);
+
+  // ====== Section 1: Jelajahi [artis] ======
+  if (otherByArtist.length > 0 || albumsByArtist.length > 0) {
+    const wrap = el('div', 'mx-4 mt-4 mb-3 p-4 rounded-xl bg-white/5');
+    wrap.appendChild(el('div', 'font-bold mb-3', `Jelajahi ${t.artist}`));
+
+    // Carousel horizontal — lagu + album
+    const row = el('div', 'flex gap-3 overflow-x-auto scroll-y -mx-1 px-1 pb-1');
+    row.style.scrollSnapType = 'x mandatory';
+
+    // Card "Lagu oleh [artis]" → buka artist view, scroll ke section lagu
+    if (otherByArtist.length > 0) {
+      const card = el('button', 'flex-shrink-0 w-32 text-left');
+      card.style.scrollSnapAlign = 'start';
+      const cov = el('div', 'w-32 h-32 rounded bg-spo-elevated mb-2');
+      const ft = otherByArtist.find(x => x.cover);
+      if (ft) { const cu = coverUrl(ft); if (cu) cov.style.backgroundImage = `url(${cu})`, cov.style.backgroundSize = 'cover', cov.style.backgroundPosition = 'center'; }
+      card.appendChild(cov);
+      card.appendChild(el('div', 'text-sm font-semibold line-clamp-2 leading-tight', `Lagu oleh ${t.artist}`));
+      card.appendChild(el('div', 'text-xs text-spo-textMuted mt-0.5', `${otherByArtist.length} lagu`));
+      card.onclick = () => {
+        closeSheetWithAnim(document.querySelector('.fixed.inset-0.z-40'), document.querySelector('.fixed.inset-0.z-40'),
+          () => setState({ view: 'artist', viewParam: t.artist, fullPlayerOpen: false }), true);
+      };
+      row.appendChild(card);
+    }
+
+    // Card per album lain
+    albumsByArtist.forEach(albumName => {
+      const card = el('button', 'flex-shrink-0 w-32 text-left');
+      card.style.scrollSnapAlign = 'start';
+      const cov = el('div', 'w-32 h-32 rounded bg-spo-elevated mb-2');
+      const ft = state.tracks.find(x => x.artist === t.artist && x.album === albumName && x.cover);
+      if (ft) { const cu = coverUrl(ft); if (cu) cov.style.backgroundImage = `url(${cu})`, cov.style.backgroundSize = 'cover', cov.style.backgroundPosition = 'center'; }
+      card.appendChild(cov);
+      card.appendChild(el('div', 'text-sm font-semibold line-clamp-2 leading-tight', albumName));
+      card.appendChild(el('div', 'text-xs text-spo-textMuted mt-0.5', 'Album'));
+      card.onclick = () => {
+        closeSheetWithAnim(document.querySelector('.fixed.inset-0.z-40'), document.querySelector('.fixed.inset-0.z-40'),
+          () => setState({ view: 'album', viewParam: albumName, fullPlayerOpen: false }), true);
+      };
+      row.appendChild(card);
+    });
+
+    wrap.appendChild(row);
+    body.appendChild(wrap);
+  }
+
+  // ====== Section 2: Tentang artis ======
+  const aboutWrap = el('div', 'mx-4 mb-6 rounded-xl bg-white/5 overflow-hidden');
+  aboutWrap.appendChild(el('div', 'font-bold px-4 pt-4 pb-3', 'Tentang artis'));
+
+  // Foto artis besar
+  const photoBox = el('div', 'relative w-full bg-spo-elevated');
+  photoBox.style.aspectRatio = '4 / 3';
+  // Lazy-load foto artis dari MusicBrainz (cached)
+  getArtistImage(t.artist).then(url => {
+    if (url) {
+      photoBox.style.backgroundImage = `url(${url})`;
+      photoBox.style.backgroundSize = 'cover';
+      photoBox.style.backgroundPosition = 'center';
+    } else {
+      // Fallback: pakai cover salah satu lagu artis ini
+      const ft = state.tracks.find(x => x.artist === t.artist && x.cover);
+      if (ft) {
+        const cu = coverUrl(ft);
+        if (cu) photoBox.style.backgroundImage = `url(${cu})`, photoBox.style.backgroundSize = 'cover', photoBox.style.backgroundPosition = 'center';
+      }
+    }
+  });
+  // Gradient overlay supaya text di bawah tetap readable
+  const photoGrad = el('div', 'absolute inset-0');
+  photoGrad.style.background = 'linear-gradient(180deg, transparent 50%, rgba(0,0,0,0.7) 100%)';
+  photoBox.appendChild(photoGrad);
+  aboutWrap.appendChild(photoBox);
+
+  // Info bar
+  const aboutInfo = el('div', 'px-4 py-3');
+  const aboutInfoTop = el('div', 'flex items-center justify-between gap-3');
+  const aboutLeft = el('div', 'flex-1 min-w-0');
+  aboutLeft.appendChild(el('div', 'text-xl font-bold truncate', t.artist));
+  // Stats dari koleksi user
+  const artistTracks = state.tracks.filter(x => x.artist === t.artist);
+  const totalPlays = artistTracks.reduce((sum, x) => sum + (x.playCount || 0), 0);
+  const statsParts = [`${artistTracks.length} lagu di koleksimu`];
+  if (totalPlays > 0) statsParts.push(`${totalPlays}× diputar`);
+  aboutLeft.appendChild(el('div', 'text-xs text-spo-textMuted mt-0.5', statsParts.join(' • ')));
+  aboutInfoTop.appendChild(aboutLeft);
+
+  // Tombol "Lihat artis" — buka artist view
+  const viewBtn = el('button', 'flex-shrink-0 px-4 py-1.5 rounded-full border border-white/30 text-xs font-semibold hover:bg-white/10 active:scale-95 transition');
+  viewBtn.textContent = 'Lihat artis';
+  viewBtn.onclick = () => {
+    closeSheetWithAnim(document.querySelector('.fixed.inset-0.z-40'), document.querySelector('.fixed.inset-0.z-40'),
+      () => setState({ view: 'artist', viewParam: t.artist, fullPlayerOpen: false }), true);
+  };
+  aboutInfoTop.appendChild(viewBtn);
+  aboutInfo.appendChild(aboutInfoTop);
+  aboutWrap.appendChild(aboutInfo);
+
+  body.appendChild(aboutWrap);
+
+  // Padding bawah supaya akhir scroll tidak mepet
+  body.appendChild(el('div', 'h-8'));
 }
 
 // ===== Lyrics Page =====
@@ -4142,6 +4309,27 @@ function renderSettingsSheet() {
   };
   sheet.appendChild(dedupeRow);
 
+  // --- Cek Kesehatan Koleksi (diagnostic — temukan lagu yang corrupt/blob hilang) ---
+  const healthRow = el('button', 'w-full flex items-center gap-3 px-5 py-3 hover:bg-white/5 transition text-left');
+  const healthIc = el('div', 'flex-shrink-0 text-orange-400');
+  healthIc.innerHTML = svgIcon('check-circle', 22);
+  healthRow.appendChild(healthIc);
+  const healthText = el('div', 'flex-1 min-w-0');
+  healthText.appendChild(el('div', 'font-semibold', 'Cek kesehatan koleksi'));
+  healthText.appendChild(el('div', 'text-xs text-spo-textMuted mt-0.5', 'Cari lagu yang gak bisa diputar (file audio hilang, durasi 0, dll). Bisa otomatis hapus yang corrupt.'));
+  healthRow.appendChild(healthText);
+  const healthArrow = el('div', 'flex-shrink-0 text-white/40');
+  healthArrow.innerHTML = svgIcon('chevron-down', 18);
+  healthArrow.style.transform = 'rotate(-90deg)';
+  healthRow.appendChild(healthArrow);
+  healthRow.onclick = () => {
+    closeSheetWithAnim(overlay, sheet, () => {
+      setState({ settingsSheetOpen: false });
+      setTimeout(() => openHealthCheck(), 50);
+    });
+  };
+  sheet.appendChild(healthRow);
+
   // Padding bawah
   sheet.appendChild(el('div', 'h-8'));
 
@@ -4436,6 +4624,132 @@ function openPlaylistActionMenu(pl, tracks) {
 
   dialog.appendChild(sheet);
   document.body.appendChild(dialog);
+}
+
+// ----- Health Check Dialog -----
+// Scan semua track, identify yang bermasalah, kasih opsi hapus.
+// Kategori masalah:
+//   1. blob hilang/null (file audio gak ada — paling kritis)
+//   2. blob ada tapi size 0 (corrupt)
+//   3. durasi 0/NaN tapi blob ada (bisa di-fix, tinggal play sekali)
+async function openHealthCheck() {
+  const dialog = el('div', 'fixed inset-0 z-[70] flex flex-col bg-spo-bg safe-top safe-bottom');
+
+  const top = el('div', 'flex items-center p-3 border-b border-white/10 flex-shrink-0');
+  const close = el('button', 'p-2 hover:bg-white/10 rounded-full');
+  close.innerHTML = svgIcon('close', 22);
+  close.onclick = () => dialog.remove();
+  top.appendChild(close);
+  top.appendChild(el('div', 'flex-1 text-center font-bold truncate px-2', 'Cek Kesehatan Koleksi'));
+  top.appendChild(el('div', 'w-9'));
+  dialog.appendChild(top);
+
+  const body = el('div', 'flex-1 overflow-y-auto scroll-y p-4');
+  dialog.appendChild(body);
+
+  // Loading state
+  const progressBox = el('div', 'flex flex-col items-center justify-center py-12');
+  progressBox.appendChild(el('div', 'text-orange-400 mb-4 text-3xl', '🩺'));
+  const progressText = el('div', 'text-sm text-spo-textMuted', 'Memeriksa koleksi...');
+  progressBox.appendChild(progressText);
+  body.appendChild(progressBox);
+
+  document.body.appendChild(dialog);
+
+  // Scan setelah dialog muncul supaya UI gak freeze
+  await new Promise(r => setTimeout(r, 50));
+
+  const broken = [];   // blob hilang sama sekali atau size 0 — gak bisa diputar
+  const missingDur = []; // blob OK tapi durasi 0/NaN — masih bisa diputar, durasi akan auto-fix
+
+  for (let i = 0; i < state.tracks.length; i++) {
+    const t = state.tracks[i];
+    progressText.textContent = `Memeriksa ${i + 1} / ${state.tracks.length} lagu...`;
+    if (!t.blob || !(t.blob instanceof Blob) || t.blob.size === 0) {
+      broken.push(t);
+    } else if (!t.duration || !isFinite(t.duration) || t.duration <= 0) {
+      missingDur.push(t);
+    }
+    // Yield ke main thread tiap 20 lagu supaya UI tetap responsive
+    if (i % 20 === 0) await new Promise(r => setTimeout(r, 0));
+  }
+
+  body.innerHTML = '';
+
+  // Ringkasan
+  const summary = el('div', 'mb-4 p-4 rounded-lg bg-white/5');
+  summary.appendChild(el('div', 'text-sm text-spo-textMuted', `Total koleksi: ${state.tracks.length} lagu`));
+  summary.appendChild(el('div', `text-base font-semibold mt-1 ${broken.length > 0 ? 'text-red-400' : 'text-spo-green'}`,
+    broken.length === 0 ? '✓ Semua file audio sehat' : `⚠ ${broken.length} lagu tidak bisa diputar (file hilang)`));
+  if (missingDur.length > 0) {
+    summary.appendChild(el('div', 'text-sm text-yellow-400 mt-1', `${missingDur.length} lagu durasinya 0 (auto-fix saat diputar)`));
+  }
+  body.appendChild(summary);
+
+  // === Section: Broken (kritis) ===
+  if (broken.length > 0) {
+    const head = el('div', 'flex items-center justify-between mb-2 mt-4');
+    head.appendChild(el('div', 'font-bold text-red-400', `File hilang (${broken.length})`));
+    const delAll = el('button', 'text-xs font-semibold text-red-400 px-3 py-1.5 rounded-full bg-red-500/10 hover:bg-red-500/20');
+    delAll.textContent = 'Hapus semua';
+    delAll.onclick = async () => {
+      if (!confirm(`Hapus ${broken.length} lagu yang file audio-nya hilang? Metadata (judul, cover) ikut terhapus dari koleksi.`)) return;
+      delAll.disabled = true;
+      delAll.textContent = 'Menghapus...';
+      for (const t of broken) {
+        try { await deleteTrack(t.id); } catch (e) {}
+      }
+      showToast(`${broken.length} lagu corrupt dihapus dari koleksi`, 2500, 'success');
+      dialog.remove();
+    };
+    head.appendChild(delAll);
+    body.appendChild(head);
+
+    body.appendChild(el('div', 'text-xs text-spo-textMuted mb-3', 'Blob audio tidak ada di IndexedDB. Kemungkinan storage HP di-evict browser, atau import gagal. Lagu ini harus di-import ulang dari file asli.'));
+
+    broken.forEach(t => {
+      const row = el('div', 'flex items-center gap-3 p-2 rounded hover:bg-white/5');
+      const cov = el('div', 'w-10 h-10 bg-spo-elevated rounded flex-shrink-0');
+      if (t.cover) { const cu = coverUrl(t); if (cu) cov.style.backgroundImage = `url(${cu})`, cov.style.backgroundSize = 'cover'; }
+      row.appendChild(cov);
+      const info = el('div', 'flex-1 min-w-0');
+      info.appendChild(el('div', 'text-sm font-semibold truncate', t.title));
+      info.appendChild(el('div', 'text-xs text-spo-textMuted truncate', t.artist || 'Unknown'));
+      row.appendChild(info);
+      const delBtn = el('button', 'p-2 text-red-400 hover:bg-red-500/10 rounded-full');
+      delBtn.innerHTML = svgIcon('trash', 18);
+      delBtn.onclick = async () => {
+        try { await deleteTrack(t.id); } catch (e) {}
+        row.remove();
+      };
+      row.appendChild(delBtn);
+      body.appendChild(row);
+    });
+  }
+
+  // === Section: Missing duration (informational) ===
+  if (missingDur.length > 0) {
+    body.appendChild(el('div', 'font-bold text-yellow-400 mt-6 mb-2', `Durasi belum ke-ukur (${missingDur.length})`));
+    body.appendChild(el('div', 'text-xs text-spo-textMuted mb-3', 'Lagu ini masih bisa diputar — durasi akan terukur otomatis saat pertama play. Bisa diabaikan.'));
+    missingDur.slice(0, 10).forEach(t => {
+      const row = el('div', 'flex items-center gap-3 p-2 rounded');
+      const cov = el('div', 'w-10 h-10 bg-spo-elevated rounded flex-shrink-0');
+      if (t.cover) { const cu = coverUrl(t); if (cu) cov.style.backgroundImage = `url(${cu})`, cov.style.backgroundSize = 'cover'; }
+      row.appendChild(cov);
+      const info = el('div', 'flex-1 min-w-0');
+      info.appendChild(el('div', 'text-sm font-semibold truncate', t.title));
+      info.appendChild(el('div', 'text-xs text-spo-textMuted truncate', t.artist || 'Unknown'));
+      row.appendChild(info);
+      body.appendChild(row);
+    });
+    if (missingDur.length > 10) {
+      body.appendChild(el('div', 'text-xs text-spo-textMuted text-center mt-2', `dan ${missingDur.length - 10} lagu lainnya...`));
+    }
+  }
+
+  if (broken.length === 0 && missingDur.length === 0) {
+    body.appendChild(el('div', 'text-center text-spo-green text-lg py-8', '🎉 Koleksi 100% sehat'));
+  }
 }
 
 // ----- Duplicate Finder Dialog -----
@@ -4822,6 +5136,7 @@ function svgIcon(name, size = 24) {
     'plus-circle': `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>`,
     'minus-circle': `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>`,
     'check-circle-filled': `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/><path d="M9 12l2 2 4-4" fill="none" stroke="#000" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+    'check-circle': `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-4"/></svg>`,
     heart: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7-4.5-9-9c-1.5-3.5 1-7 4.5-7 2 0 3.5 1 4.5 2.5C13 6 14.5 5 16.5 5 20 5 22.5 8.5 21 12c-2 4.5-9 9-9 9z"/></svg>`,
     'heart-filled': `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7-4.5-9-9c-1.5-3.5 1-7 4.5-7 2 0 3.5 1 4.5 2.5C13 6 14.5 5 16.5 5 20 5 22.5 8.5 21 12c-2 4.5-9 9-9 9z"/></svg>`,
     music: `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/><path d="M9 18V5l12-2v13"/></svg>`,

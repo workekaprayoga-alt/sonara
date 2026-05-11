@@ -1,70 +1,84 @@
-# Sonara v11 — Cleanup & Lirik Halaman Terpisah
+# Sonara v12 — Spotify-style Full Player + Bug Fix
 
-Release ini fokus bersih-bersih: hapus fitur yang gak kepake atau bikin ribet, fix
-tombol-tombol yang mati, dan pisahkan lirik jadi halaman tersendiri supaya gak
-tindih background full player.
+Dua hal utama: fix lagu yang gak bisa diputar (durasi 0), dan rombak full player
+jadi scrollable dengan section "Jelajahi artis" + "Tentang artis" persis kayak
+Spotify.
 
-## 🗑️ Dihapus
+## 🐛 Bug fix utama: lagu gak bisa diputar / durasi 0
 
-- **Canvas video** — fitur upload .mp4 per lagu. Capek nge-upload satu-satu dan
-  storage HP cepat penuh. Default sekarang cuma Ken Burns cover (slow zoom-pan).
-- **Equalizer 5-band** — efeknya subtle dan beberapa preset malah bikin audio
-  jelek di speaker HP. Pakai aja audio asli MP3-nya.
-- **Volume normalization** — peak detection async yang kadang lambat, efek
-  marginal. Skip.
-- **Mode Vinyl** — sisa-sisa v8 (state DB tetap untuk backward-compat).
-- **Tombol Device** (pojok kiri bawah full player) — Sonara cuma main di HP
-  sendiri, gak ada konsep Spotify Connect.
-- **Tombol Share** (pojok kanan full player) — sesuai permintaan.
-- **Tombol Download** di header album — semua lagu udah lokal, gak ada konsep
-  download.
+Penyebab di v10/v11:
+- `extractMetadata` cuma kasih 3 detik untuk baca durasi → di HP slow atau MP3
+  besar, durasi sering masih 0 saat timeout
+- MP3 VBR (Variable Bit Rate) sering report `Infinity` atau `NaN` untuk
+  `audio.duration` → disimpan sebagai 0 di DB
+- `loadAndPlay` gak validasi blob — kalau blob hilang/corrupt (storage
+  IndexedDB di-evict browser, quota habis), `URL.createObjectURL(null)` throw
+  silent, lagu gak jalan tanpa pesan
 
-## ✨ Ditambah
+Fix di v12:
+- **Timeout durasi 3s → 5s**, plus handle `Infinity`/`NaN` properly
+- **Auto-fix durasi saat play**: lagu dengan durasi 0 akan diukur ulang saat
+  pertama diputar, lalu disimpan permanen ke DB
+- **Validasi blob** di `loadAndPlay`: kalau hilang/rusak, kasih toast jelas
+  "File audio hilang, import ulang lagu ini" — bukan diam-diam mati
 
-### Lirik halaman terpisah penuh
+## 🩺 Cek Kesehatan Koleksi (tools baru)
 
-Tap **LIRIK** di full player → halaman lirik baru muncul (slide-up, full-screen),
-bukan overlay tindih background lagi.
+Pengaturan → Koleksi → **Cek kesehatan koleksi**
 
-- **Synced lyrics**: tetap auto-scroll dengan highlight + center baris aktif.
-  Tap baris = jump ke timestamp itu.
-- **Plain lyrics**: scroll biasa, font size lebih besar (text-lg, semibold).
-- **Bottom mini-player**: seek bar + play/pause di bawah, jadi gak perlu close
-  lirik buat kontrol musik.
-- **Top bar**: cover kecil + judul + artis + tombol ⋯ (akses context menu lagu).
-- Background: cover blur tipis + gradient hitam — tetap konsisten dengan vibe
-  full player, tanpa interference.
+Scan semua lagu di koleksi, identifikasi yang bermasalah:
+- **File hilang** — blob audio gak ada di IndexedDB (paling kritis, gak bisa
+  diputar). Bisa hapus satu-satu atau bulk "Hapus semua".
+- **Durasi belum ke-ukur** — masih bisa diputar, durasi akan auto-fix saat
+  pertama play. Info aja, gak perlu action.
 
-### Tombol ⋯ di header album / artis / playlist
+Yang kemungkinan terjadi di kasusmu:
+- Kalau 60 lagu hilang blob-nya → browser evict IndexedDB (storage HP penuh)
+- Kalau cuma durasi 0 tapi bisa diputar → metadata bug yang sekarang udah
+  di-fix; tinggal play satu kali, durasi otomatis terisi
 
-Sebelumnya cuma icon mati. Sekarang fungsional:
+## 🎬 Full Player baru — scrollable, Spotify-style
 
-- **Album / Artis**: Putar semua, Acak semua, Tambah semua ke antrean,
-  Tambah semua ke playlist.
-- **Playlist**: di atas itu + Ganti cover playlist + Hapus playlist (dengan
-  konfirmasi).
+Sebelumnya full player static — kontrol di tengah, sisanya kosong. Sekarang
+scrollable dengan section di bawah kontrol:
 
-### Scroll position restore
+### Cover besar + info + kontrol (zone atas, seperti biasa)
+Cover sekarang square ~85vw besar, lebih dominan, mirip Spotify modern.
 
-Sebelumnya tiap kali masuk sub-view (album/artis/playlist) lalu kembali, scroll
-loncat balik ke atas. Sekarang posisi scroll disimpan per-view dan di-restore
-otomatis saat balik — gak perlu scroll ulang dari atas.
+### "Jelajahi [artis]" — section baru
+Carousel horizontal di card abu-abu:
+- **Card "Lagu oleh [artis]"** — tap = buka artist view
+- **Card per album lain dari artis ini** — tap = buka album view
+- Diambil murni dari koleksimu sendiri, tidak ada data eksternal
 
-## 🐛 Fix
+### "Tentang artis" — section baru
+Card abu-abu dengan:
+- **Foto artis besar** (4:3 ratio) — auto-fetch dari MusicBrainz, fallback ke
+  cover album kalau gak ada
+- **Nama artis** + stats dari koleksimu: "N lagu di koleksimu • M× diputar"
+- **Tombol "Lihat artis"** — buka artist view
 
-- Lirik tidak lagi tampak "tindih" canvas/cover karena sekarang full screen.
-- Tombol-tombol di header album yang dulu dummy (download, more) sekarang
-  berfungsi semua.
+### Kenapa tidak ada "Pratinjau lirik"?
+Sesuai pilihanmu — lirik udah cukup di halaman terpisah (v11). Tombol LIRIK di
+top bar tetap ada untuk buka halaman lirik full.
+
+### Kenapa tidak ada "Kredit"?
+99% MP3 cuma punya tag artist + album, tidak ada composer/lyricist. Kalau
+ditambah, mayoritas lagu kreditnya kosong → bikin section ini useless.
+Skip dulu, bisa ditambah nanti kalau mayoritas MP3-mu punya tag TCOM/TEXT.
+
+### Kenapa tidak ada "Pendengar bulanan" / "Serupa dengan"?
+Itu data Spotify dari jutaan user. Sonara murni lokal, gak punya akses ke data
+recommendation engine. Kita pakai data yang kita punya: koleksi user sendiri.
 
 ## 📦 Deploy
 
-Upload 2 file: `index.html`, `sw.js`. Vercel redeploy, SW auto-update ke v16.
+Upload 2 file: `index.html`, `sw.js`. SW auto-update ke v17.
 
 Test penting:
-1. Buka full player → tap LIRIK → halaman lirik full slide-up dari bawah.
-   Tombol kembali (Android) atau chevron-down menutup ke full player.
-2. Buka album manapun → tap ⋯ di header → coba "Putar semua" / "Acak semua".
-3. Scroll di Home, masuk ke album, kembali → scroll harusnya tetap di posisi
-   yang sama, bukan balik ke atas.
-4. Pengaturan → tidak ada lagi toggle Equalizer / Normalisasi volume / Mode
-   Vinyl. Tinggal Crossfade, Gapless, Sleep fade-out, dan Cari lagu duplikat.
+1. **Cek kesehatan koleksi** dulu — Pengaturan → "Cek kesehatan koleksi".
+   Kalau ada "File hilang", itu yang bikin 60 lagu gak bisa diputar.
+2. Buka full player → scroll ke bawah → harusnya muncul "Jelajahi [artis]"
+   carousel + "Tentang artis" dengan foto + stats.
+3. Lagu yang durasinya 0 → play satu kali → durasi harusnya muncul. Restart
+   app, lagu tersebut harusnya nampak durasi yang benar.
