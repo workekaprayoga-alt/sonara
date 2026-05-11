@@ -1,5 +1,19 @@
 # Sonara Changelog
 
+## v13.2.1 — Fix Penyimpanan (Mei 2026)
+
+### 🐛 Perbaikan
+
+- **Ukuran file 0 KB untuk lagu lama** — Track yang di-import sebelum v13.2 belum punya field `fileSize`, jadi muncul "0 KB" di stats dan di "Lagu Paling Besar". Sekarang ada migrasi otomatis saat aplikasi dibuka: ukuran dibaca ulang dari blob audio yang sudah tersimpan di IndexedDB. Sekali buka aplikasi, semua data ukuran akan terisi.
+- **Tombol kembali dari "Lagu Paling Besar"** — Sebelumnya menutup Lagu Paling Besar langsung jump ke Koleksi, melompati sheet Penyimpanan. Sekarang back button benar — Lagu Paling Besar → Penyimpanan → Koleksi.
+- **Duplikat menu di sheet Penyimpanan** — Hapus shortcut "Cari Duplikat" dan "Cek Kesehatan" dari section Tindakan karena keduanya sudah ada di Pengaturan. Sekarang Tindakan hanya berisi "Lagu Paling Besar" (yang memang unik untuk sheet ini).
+
+### Deploy
+
+Upload **index.html** + **sw.js** → SW v21 auto-update. Saat aplikasi dibuka pertama kali setelah update, semua ukuran lagu akan otomatis di-backfill (proses cepat, langsung di background).
+
+---
+
 ## v13.2 — Penyimpanan & Statistik (Mei 2026)
 
 ### 🆕 Penyimpanan & Statistik

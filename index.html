@@ -1997,6 +1997,15 @@ async function init() {
     if (t.lastPlayedAt === undefined) { t.lastPlayedAt = null; needsSave = true; }
     if (t.lyrics === undefined) { t.lyrics = null; needsSave = true; }
     if (t.lyricsSynced === undefined) { t.lyricsSynced = null; needsSave = true; }
+    // Backfill fileSize untuk track lama (sebelum v13.2 field ini belum ada)
+    // Ambil dari blob.size yang udah ada di IndexedDB
+    if ((!t.fileSize || t.fileSize === 0) && t.blob && t.blob.size) {
+      t.fileSize = t.blob.size;
+      needsSave = true;
+    }
+    // Backfill fileName/fileType juga kalau belum ada (jaga-jaga buat format breakdown)
+    if (!t.fileName && t.blob && t.blob.name) { t.fileName = t.blob.name; needsSave = true; }
+    if (!t.fileType && t.blob && t.blob.type) { t.fileType = t.blob.type; needsSave = true; }
     if (needsSave) { try { dbPut(STORE_TRACKS, t); } catch(e){} }
     return t;
   });
@@ -5398,48 +5407,10 @@ async function openStorageSheet() {
     lArrow.style.transform = 'rotate(-90deg)';
     largestBtn.appendChild(lArrow);
     largestBtn.onclick = () => {
-      closeDialog();
-      setTimeout(() => openLargestTracksDialog(), 50);
+      // Jangan close Storage sheet — biar back button balik ke sini
+      openLargestTracksDialog();
     };
     actionWrap.appendChild(largestBtn);
-
-    // --- Cari duplikat ---
-    const dedupeBtn = el('button', 'w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition text-left');
-    const dIc = el('div', 'flex-shrink-0 text-spo-green');
-    dIc.innerHTML = svgIcon('search', 22);
-    dedupeBtn.appendChild(dIc);
-    const dTxt = el('div', 'flex-1 min-w-0');
-    dTxt.appendChild(el('div', 'text-sm font-semibold', 'Cari lagu duplikat'));
-    dTxt.appendChild(el('div', 'text-xs text-white/50', 'Hapus salinan untuk hemat ruang'));
-    dedupeBtn.appendChild(dTxt);
-    const dArrow = el('div', 'text-white/40');
-    dArrow.innerHTML = svgIcon('chevron-down', 16);
-    dArrow.style.transform = 'rotate(-90deg)';
-    dedupeBtn.appendChild(dArrow);
-    dedupeBtn.onclick = () => {
-      closeDialog();
-      setTimeout(() => openDedupeFinder(), 50);
-    };
-    actionWrap.appendChild(dedupeBtn);
-
-    // --- Cek kesehatan (hapus file rusak) ---
-    const healthBtn = el('button', 'w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition text-left');
-    const hIc = el('div', 'flex-shrink-0 text-orange-400');
-    hIc.innerHTML = svgIcon('check-circle', 22);
-    healthBtn.appendChild(hIc);
-    const hTxt = el('div', 'flex-1 min-w-0');
-    hTxt.appendChild(el('div', 'text-sm font-semibold', 'Cek kesehatan koleksi'));
-    hTxt.appendChild(el('div', 'text-xs text-white/50', 'Hapus file audio yang rusak/hilang'));
-    healthBtn.appendChild(hTxt);
-    const haArrow = el('div', 'text-white/40');
-    haArrow.innerHTML = svgIcon('chevron-down', 16);
-    haArrow.style.transform = 'rotate(-90deg)';
-    healthBtn.appendChild(haArrow);
-    healthBtn.onclick = () => {
-      closeDialog();
-      setTimeout(() => openHealthCheck(), 50);
-    };
-    actionWrap.appendChild(healthBtn);
 
     body.appendChild(actionWrap);
   }
@@ -5449,7 +5420,7 @@ async function openStorageSheet() {
 
 // ----- Largest Tracks Dialog (sort by file size, allow delete) -----
 async function openLargestTracksDialog() {
-  const dialog = el('div', 'fixed inset-0 z-[70] flex flex-col bg-spo-bg safe-top safe-bottom');
+  const dialog = el('div', 'fixed inset-0 z-[75] flex flex-col bg-spo-bg safe-top safe-bottom');
   const closeDialog = () => { if (dialog.parentNode) dialog.remove(); unregisterDomDialog(closeDialog); };
 
   const top = el('div', 'flex items-center p-3 border-b border-white/10 flex-shrink-0');
